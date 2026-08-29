@@ -28,7 +28,9 @@
 #include <linux/landlock.h>
 #include <linux/seccomp.h>
 #include <net/if.h>
+#include <poll.h>
 #include <signal.h>
+#include <stdint.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
@@ -36,6 +38,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <sched.h>
 #include <stdio.h>
@@ -143,6 +146,12 @@ static int   g_sync[2];              /* parent -> child: uid maps ready */
 static char  g_newroot[] = "/tmp/agentcell-root.XXXXXX";
 static char  g_cgpath[PATH_MAX];
 static int   g_have_cg;
+
+/* ---- long-running (serve) mode ---- */
+static int   g_serve;                 /* 1 = jail stays alive, serves execs */
+static int   g_host_sock = -1;        /* supervisor end of the socketpair   */
+static int   g_jail_sock = -1;        /* jail end, inherited by the child   */
+static char  g_sock_path[PATH_MAX];   /* host-facing unix socket            */
 
 /* ------------------------------------------------------------------ */
 /* 1. cgroup v2 limits (unprivileged, via systemd's delegated subtree) */
@@ -580,6 +589,304 @@ static void net_lo_up(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* long-running mode: the jail stays alive, commands stream in over a  */
+/* unix socket. Connection fds are passed across the namespace with   */
+/* SCM_RIGHTS, so data flows client <-> jailed command directly.      */
+/* wire format (little endian):                                        */
+/*   request:  u32 argc { u32 len, bytes }*argc  u32 stdin_len bytes   */
+/*   response: raw stdout/stderr, then u32 exit status, then EOF      */
+/* ------------------------------------------------------------------ */
+
+static void put_u32(char *b, uint32_t v)
+{
+    b[0] = v; b[1] = v >> 8; b[2] = v >> 16; b[3] = v >> 24;
+}
+
+static uint32_t get_u32(const char *b)
+{
+    return (uint8_t)b[0] | ((uint8_t)b[1] << 8) |
+           ((uint8_t)b[2] << 16) | ((uint32_t)(uint8_t)b[3] << 24);
+}
+
+static int read_full(int fd, void *buf, size_t n)
+{
+    char *p = buf;
+    while (n) {
+        ssize_t r = read(fd, p, n);
+        if (r <= 0) return -1;
+        p += r; n -= r;
+    }
+    return 0;
+}
+
+static int write_full(int fd, const void *buf, size_t n)
+{
+    const char *p = buf;
+    while (n) {
+        ssize_t r = write(fd, p, n);
+        if (r <= 0) return -1;
+        p += r; n -= r;
+    }
+    return 0;
+}
+
+/* the jail side: run one command with its stdio on the client socket */
+static void handle_conn(int conn)
+{
+    enum { MAXARGS = 256 };
+    char *argv[MAXARGS + 1] = {0};
+    uint32_t argc;
+
+    if (read_full(conn, &argc, 4) || argc == 0 || argc > MAXARGS)
+        goto out;
+
+    for (uint32_t i = 0; i < argc; i++) {
+        uint32_t len;
+        if (read_full(conn, &len, 4) || len == 0 || len > 65536)
+            goto out;
+        argv[i] = malloc(len + 1);
+        if (!argv[i] || read_full(conn, argv[i], len))
+            goto out;
+        argv[i][len] = 0;
+    }
+
+    /* optional stdin blob -> memfd (allowed: memfd_create isn't denied) */
+    uint32_t slen;
+    int in_fd = open("/dev/null", O_RDONLY);
+    if (!read_full(conn, &slen, 4) && slen) {
+        in_fd = syscall(SYS_memfd_create, "stdin", 0);
+        char buf[65536];
+        while (slen) {
+            size_t chunk = slen > sizeof buf ? sizeof buf : slen;
+            if (read_full(conn, buf, chunk)) break;
+            if (write_full(in_fd, buf, chunk)) break;
+            slen -= chunk;
+        }
+        lseek(in_fd, 0, SEEK_SET);
+    }
+
+    pid_t p = fork();
+    if (p == 0) {
+        dup2(in_fd, 0);
+        dup2(conn, 1);
+        dup2(conn, 2);
+        for (int fd = 3; fd < 64; fd++) close(fd);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    close(in_fd);
+
+    int st = 0;
+    waitpid(p, &st, 0);
+    uint32_t code = WIFEXITED(st) ? (uint32_t)WEXITSTATUS(st)
+                  : WIFSIGNALED(st) ? 128u + (uint32_t)WTERMSIG(st) : 1;
+    write_full(conn, &(uint32_t){0}, 0);   /* no-op keeps gcc quiet */
+    put_u32((char *)&code, code);
+    write_full(conn, &code, 4);
+
+out:
+    for (uint32_t i = 0; argv[i]; i++) free(argv[i]);
+    close(conn);
+}
+
+/* the jail side: receive client fds from the supervisor, forever */
+static void jail_server(int fd)
+{
+    for (;;) {
+        char cmd;
+        char cbuf[CMSG_SPACE(sizeof(int))];
+        struct iovec iov = { .iov_base = &cmd, .iov_len = 1 };
+        struct msghdr msg = {0};
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cbuf;
+        msg.msg_controllen = sizeof cbuf;
+
+        ssize_t r = recvmsg(fd, &msg, 0);
+        if (r <= 0)
+            break;                       /* supervisor gone -> die */
+        struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+        if (!c || c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS)
+            continue;
+        handle_conn(*(int *)CMSG_DATA(c));
+    }
+    _exit(0);
+}
+
+/* supervisor: hand one client connection into the jail */
+static void send_fd(int sock, int fd)
+{
+    char b = 'E';
+    char cbuf[CMSG_SPACE(sizeof(int))];
+    struct iovec iov = { .iov_base = &b, .iov_len = 1 };
+    struct msghdr msg = {0};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf;
+    msg.msg_controllen = sizeof cbuf;
+    struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int));
+    *(int *)CMSG_DATA(c) = fd;
+    sendmsg(sock, &msg, 0);
+}
+
+/* supervisor: accept on the host socket until the jail dies */
+static volatile sig_atomic_t g_stop;
+
+static void on_stop(int sig) { (void)sig; g_stop = 1; }
+
+static void serve_loop(pid_t jail)
+{
+    close(g_jail_sock);
+    signal(SIGINT, on_stop);
+    signal(SIGTERM, on_stop);
+
+    int lfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_un a = { .sun_family = AF_UNIX };
+    const char *rt = getenv("XDG_RUNTIME_DIR");
+    if (!rt) rt = "/tmp";
+    snprintf(g_sock_path, sizeof g_sock_path, "%s/agentcell-%d.sock", rt,
+             (int)jail);
+    unlink(g_sock_path);
+    snprintf(a.sun_path, sizeof a.sun_path, "%s", g_sock_path);
+    socklen_t alen = offsetof(struct sockaddr_un, sun_path) +
+                     strlen(a.sun_path) + 1;
+    if (bind(lfd, (struct sockaddr *)&a, alen) < 0 ||
+        listen(lfd, 16) < 0)
+        die("listen socket");
+    chmod(g_sock_path, 0600);
+
+    fprintf(stderr, "sand: serving %s  (jail pid %d, Ctrl-C to stop)\n",
+            g_sock_path, jail);
+
+    for (;;) {
+        if (g_stop) break;
+        struct pollfd pf[2] = {
+            { .fd = lfd,         .events = POLLIN },
+            { .fd = g_host_sock, .events = POLLIN },
+        };
+        if (poll(pf, 2, -1) < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        /* jail closed its end? */
+        if (pf[1].revents) {
+            char b;
+            if (recv(g_host_sock, &b, 1, MSG_PEEK | MSG_DONTWAIT) <= 0)
+                break;
+        }
+        if (pf[0].revents & POLLIN) {
+            int c = accept4(lfd, NULL, NULL, SOCK_CLOEXEC);
+            if (c >= 0) {
+                send_fd(g_host_sock, c);
+                close(c);
+            }
+        }
+        int st;
+        if (waitpid(jail, &st, WNOHANG) == jail)
+            break;
+    }
+
+    kill(jail, SIGKILL);
+    waitpid(jail, NULL, 0);
+    unlink(g_sock_path);
+    fprintf(stderr, "sand: jail stopped\n");
+}
+
+/* host client: sand exec SOCK [--] CMD ARGS... */
+static int client_exec(char **av)
+{
+    /* av = [SOCK, ("--"), CMD, ARGS...] */
+    if (!av[0] || !av[1]) {
+        fprintf(stderr, "usage: sand exec SOCK [--] CMD ARGS...\n");
+        return 2;
+    }
+    char *sock = av[0];
+    char **args = av + 1;
+    if (!strcmp(args[0], "--")) {
+        if (!args[1]) { fprintf(stderr, "sand: no command after --\n"); return 2; }
+        args++;
+    }
+
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un a = { .sun_family = AF_UNIX };
+    snprintf(a.sun_path, sizeof a.sun_path, "%s", sock);
+    if (connect(s, (struct sockaddr *)&a, sizeof a) < 0) {
+        fprintf(stderr, "sand: connect %s: %s\n", av[0], strerror(errno));
+        return 2;
+    }
+
+    /* build request: argc + args + stdin blob */
+    size_t cap = 1 << 16, len = 0;
+    char *req = malloc(cap);
+    if (!req) return 2;
+    uint32_t argc = 0;
+    for (char **p = args; *p; p++) argc++;
+
+    #define APPEND(ptr, n) do { \
+        if (len + (n) > cap) { \
+            while (len + (n) > cap) cap <<= 1; \
+            req = realloc(req, cap); \
+            if (!req) return 2; \
+        } \
+        memcpy(req + len, ptr, (n)); len += (n); \
+    } while (0)
+
+    char b4[4];
+    put_u32(b4, argc);
+    APPEND(b4, 4);
+    for (char **p = args; *p; p++) {
+        put_u32(b4, strlen(*p));
+        APPEND(b4, 4);
+        APPEND(*p, strlen(*p));
+    }
+
+    /* stdin: pipe it in whole (up to 64M); tty stdin is skipped */
+    size_t in_len = 0;
+    char *in_buf = NULL;
+    if (!isatty(0)) {
+        size_t icap = 1 << 16;
+        in_buf = malloc(icap);
+        for (;;) {
+            if (in_len == icap) {
+                icap <<= 1;
+                in_buf = realloc(in_buf, icap);
+                if (!in_buf) return 2;
+            }
+            ssize_t r = read(0, in_buf + in_len, icap - in_len);
+            if (r <= 0 || in_len > (64u << 20)) break;
+            in_len += r;
+        }
+    }
+    put_u32(b4, in_len);
+    APPEND(b4, 4);
+    if (in_len) APPEND(in_buf, in_len);
+
+    if (write_full(s, req, len)) { fprintf(stderr, "sand: send failed\n"); return 2; }
+    shutdown(s, SHUT_WR);
+
+    /* stream the reply; last 4 bytes are the exit status */
+    cap = 1 << 16; len = 0;
+    char *rep = malloc(cap);
+    for (;;) {
+        if (len == cap) {
+            cap <<= 1;
+            rep = realloc(rep, cap);
+            if (!rep) return 2;
+        }
+        ssize_t r = read(s, rep + len, cap - len);
+        if (r <= 0) break;
+        len += r;
+    }
+    if (len < 4) { fprintf(stderr, "sand: protocol error\n"); return 2; }
+    fwrite(rep, 1, len - 4, stdout);
+    fflush(stdout);
+    return (int)get_u32(rep + len - 4);
+}
+
+/* ------------------------------------------------------------------ */
 /* child: future PID 1 of the sandbox                                  */
 /* ------------------------------------------------------------------ */
 
@@ -624,6 +931,11 @@ static int child_main(void *arg)
     setenv("SHELL",  "/bin/bash", 1);
     setenv("LANG",   "C.UTF-8", 1);
     setenv("TERM",   "xterm-256color", 1);
+
+    if (g_serve) {
+        close(g_host_sock);
+        jail_server(g_jail_sock);      /* never returns */
+    }
 
     char *def[] = { "/bin/bash", NULL };
     char **av = C.argv ? (char **)C.argv : def;
@@ -691,13 +1003,26 @@ static void usage(FILE *out)
 "  --bind S:D    mount host path S at path D inside the sandbox (rw)\n"
 "  --bind-ro S:D same, but read-only\n"
 "  --timeout S   kill payload after S seconds\n"
-"  --no-landlock | --no-seccomp   debug switches\n");
+"  --no-landlock | --no-seccomp   debug switches\n"
+"\n"
+"long-running mode (isolation set up once, then reused):\n"
+"  sand serve [options]       start a jailed exec server, prints SOCK\n"
+"  sand exec SOCK [--] CMD..  run CMD inside that jail\n");
 }
 
 int main(int argc, char **argv)
 {
     g_uid = getuid();
     g_gid = getgid();
+
+    /* subcommands */
+    if (argc > 1 && !strcmp(argv[1], "exec"))
+        return client_exec(argv + 2);
+    if (argc > 1 && !strcmp(argv[1], "serve")) {
+        g_serve = 1;
+        argv++;
+        argc--;
+    }
 
     /* default memory limit = 60% of RAM (avoids reclaim storms; --mem wins) */
     {
@@ -801,6 +1126,14 @@ int main(int argc, char **argv)
 
     if (pipe(g_sync) < 0) die("pipe");
 
+    if (g_serve) {
+        int sp[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sp) < 0)
+            die("socketpair");
+        g_host_sock = sp[0];
+        g_jail_sock = sp[1];
+    }
+
     const int ns = CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC |
                    CLONE_NEWUTS |
                    (C.net_none ? CLONE_NEWNET : 0);
@@ -828,6 +1161,9 @@ int main(int argc, char **argv)
     }
 
     if (write(g_sync[1], "x", 1) < 0) warn2("sync child");
+
+    if (g_serve)
+        serve_loop(pid);         /* reaps the jail, cleans socket+cgroup */
 
     /* survive terminal Ctrl-C so we can reap the child and clean up */
     signal(SIGINT,  SIG_IGN);

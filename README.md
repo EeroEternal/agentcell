@@ -76,6 +76,33 @@ Inside the sandbox: workspace is `/home/agent` (rw, `~/agent-work` on the
 host), scratch is `/tmp` (tmpfs — RAM speed), full toolchain read-only at
 `/usr`, host files don't exist at all.
 
+## Long-running mode (cell server)
+
+Each one-shot sandbox costs ~5 ms to build — negligible for one agent,
+ but not for a harness firing dozens of commands per second. Serve mode
+sets up all isolation layers **once**, then executes commands on demand:
+
+```bash
+# terminal 1: start the cell (prints its socket)
+./sand serve --net host
+#   sand: serving /run/user/1000/agentcell-1120702.sock ...
+
+# any number of commands, ~2 ms each (vs ~6 ms one-shot; measured 2.7x)
+./sand exec /run/user/1000/agentcell-1120702.sock -- bash -c 'ls /usr | wc -l'
+echo data | ./sand exec /run/user/1000/agentcell-1120702.sock -- cat
+./sand exec /run/user/1000/agentcell-1120702.sock -- python3 script.py
+```
+
+Architecture: the supervisor accepts client connections on the host and
+**passes the connection fd into the jail with `SCM_RIGHTS`** — data flows
+directly between the client and the jailed command, nothing is proxied
+through the supervisor. Inside the jail a tiny exec server `fork`s per
+command (stdin via memfd, stdout/stderr = the client socket, exit status
+trailing the stream). Every layer — seccomp, Landlock, cgroup limits,
+PID/net namespaces — applies to each exec'd command. Ctrl-C (or SIGTERM)
+cleans up the socket and kills the jail; the socket lives in
+`$XDG_RUNTIME_DIR` with mode 0600.
+
 ## eBPF audit monitor (root)
 
 ```bash
