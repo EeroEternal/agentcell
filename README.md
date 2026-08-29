@@ -153,6 +153,12 @@ sudo ./agentlsm serve
 # terminal 3: policies + live denials, no root needed
 ./sand lsm        # table of armed policies, resolved to cell names
 ./sand lsm -f     # live: cell-x.sock  DENY /etc/shadow
+
+# hot policy updates on RUNNING cells — works even on cells that
+# were started WITHOUT --secure; effective on the very next open:
+./sand lsm deny  agentcell-16514 /mnt/secrets   # unique name prefix ok
+./sand lsm allow agentcell-16514 /etc/hostname
+./sand lsm reset agentcell-16514                # drop all its rules
 ```
 
 Cells register on start and unregister on exit; if the daemon is down,

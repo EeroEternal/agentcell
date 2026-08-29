@@ -19,6 +19,7 @@
  *                [--workdir DIR] [--ro DIR]... [--rw DIR]... -- CMD [ARGS]
  */
 #define _GNU_SOURCE
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -1130,51 +1131,147 @@ static void lsm_unregister(void)
     lsm_cmd(cmd, NULL, 0);
 }
 
+/* cgid -> cell-name table built from the *.info sidecars */
+struct cellname { __u64 cgid; char name[64]; };
+
+static int build_cell_table(struct cellname *cells, int max)
+{
+    int ncells = 0;
+    const char *rt = getenv("XDG_RUNTIME_DIR");
+    if (!rt) rt = "/tmp";
+    DIR *d = opendir(rt);
+    if (!d) return 0;
+    struct dirent *e;
+    while ((e = readdir(d)) && ncells < max) {
+        size_t nlen = strlen(e->d_name);
+        if (nlen < 5 || strcmp(e->d_name + nlen - 5, ".sock") ||
+            strncmp(e->d_name, "agentcell-", 10))
+            continue;
+        char base[PATH_MAX], cg[PATH_MAX] = "", line[256];
+        snprintf(base, sizeof base, "%s/%s.info", rt, e->d_name);
+        FILE *f = fopen(base, "r");
+        if (!f) continue;
+        while (fgets(line, sizeof line, f))
+            if (!strncmp(line, "cg=", 3)) {
+                line[strcspn(line, "\n")] = 0;
+                snprintf(cg, sizeof cg, "%s", line + 3);
+                break;
+            }
+        fclose(f);
+        struct stat st;
+        if (cg[0] && !stat(cg, &st)) {
+            cells[ncells].cgid = (__u64)st.st_ino;
+            snprintf(cells[ncells].name, 64, "%s", e->d_name);
+            ncells++;
+        }
+    }
+    closedir(d);
+    return ncells;
+}
+
+static const char *cell_of(const struct cellname *cells, int n, __u64 cgid)
+{
+    for (int i = 0; i < n; i++)
+        if (cells[i].cgid == cgid) return cells[i].name;
+    return "?";
+}
+
+/* resolve a user-supplied cell selector — sock path, sock basename,
+ * unique name prefix, or a raw cgid (all digits) — to a cgroup id */
+static int resolve_target(const char *sel, const struct cellname *cells,
+                          int ncells, __u64 *cgid, char *nameout, size_t nn)
+{
+    int alldigit = 1;
+    for (const char *p = sel; *p; p++)
+        if (!isdigit((unsigned char)*p)) { alldigit = 0; break; }
+    if (alldigit) {
+        *cgid = strtoull(sel, NULL, 10);
+        snprintf(nameout, nn, "%s", cell_of(cells, ncells, *cgid));
+        return 0;
+    }
+    const char *base = strrchr(sel, '/');
+    base = base ? base + 1 : sel;
+    int hit = -1, hits = 0;
+    for (int i = 0; i < ncells; i++) {
+        if (!strcmp(cells[i].name, base) ||
+            !strncmp(cells[i].name, base, strlen(base)))
+            { hit = i; hits++; }
+    }
+    if (hits == 1) {
+        *cgid = cells[hit].cgid;
+        snprintf(nameout, nn, "%s", cells[hit].name);
+        return 0;
+    }
+    return -1;
+}
+
+/* sand lsm deny|allow|reset CELL PREFIX... — hot policy updates for a
+ * running cell. "deny" also works on cells started WITHOUT --secure:
+ * registering the cgroup id with the daemon is all it takes. */
+static int lsm_ctl_cmd(char *sub, char **av)
+{
+    if (!av[0] || (strcmp(sub, "reset") && !av[1])) {
+        fprintf(stderr, "usage: sand lsm %s CELL %s\n", sub,
+                !strcmp(sub, "reset") ? "" : "PREFIX...");
+        return 2;
+    }
+    struct cellname cells[MAXBIND];
+    int ncells = build_cell_table(cells, MAXBIND);
+    __u64 cgid;
+    char name[64];
+    if (resolve_target(av[0], cells, ncells, &cgid, name, sizeof name) < 0) {
+        fprintf(stderr, "sand: cannot resolve cell '%s'", av[0]);
+        if (ncells)
+            fprintf(stderr, " — running cells:");
+        fprintf(stderr, "\n");
+        for (int i = 0; i < ncells; i++)
+            fprintf(stderr, "  %s\n", cells[i].name);
+        return 1;
+    }
+
+    char cmd[320], rep[64];
+    int rc = 0, n = 0;
+
+    if (!strcmp(sub, "reset")) {
+        snprintf(cmd, sizeof cmd, "CLR %llu", (unsigned long long)cgid);
+        if (lsm_cmd(cmd, rep, sizeof rep) < 0 || strncmp(rep, "OK", 2)) {
+            fprintf(stderr, "sand: agentlsm reset failed%s%s\n",
+                    rep[0] ? ": " : "", rep);
+            return 1;
+        }
+        printf("%s reset (all rules) — effective immediately\n", name);
+        return 0;
+    }
+
+    for (char **p = &av[1]; *p; p++) {
+        snprintf(cmd, sizeof cmd, "%s %llu %s",
+                 !strcmp(sub, "deny") ? "ADD" : "DEL",
+                 (unsigned long long)cgid, *p);
+        if (lsm_cmd(cmd, rep, sizeof rep) < 0 || strncmp(rep, "OK", 2)) {
+            fprintf(stderr, "sand: agentlsm %s %s failed%s%s\n", sub, *p,
+                    rep[0] ? ": " : "", rep);
+            rc = 1;
+        } else {
+            n++;
+            printf("%s %s %s — effective immediately\n", name, sub, *p);
+        }
+    }
+    (void)n;
+    return rc;
+}
+
 /* sand lsm [-f]: enforcement status, and live denial events.
  * cgroup ids are resolved to cell names via the *.info sidecars. */
 static int lsm_status(char **av)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);   /* live events, flush per line */
+    if (av[0] && (!strcmp(av[0], "deny") || !strcmp(av[0], "allow") ||
+                  !strcmp(av[0], "reset")))
+        return lsm_ctl_cmd(av[0], av + 1);
     int follow = av[0] && (!strcmp(av[0], "-f") || !strcmp(av[0], "--follow"));
 
-    /* build cgid -> cell-name table from running cells */
-    struct { __u64 cgid; char name[64]; } cells[MAXBIND];
-    int ncells = 0;
-    const char *rt = getenv("XDG_RUNTIME_DIR");
-    if (!rt) rt = "/tmp";
-    DIR *d = opendir(rt);
-    if (d) {
-        struct dirent *e;
-        while ((e = readdir(d)) && ncells < MAXBIND) {
-            size_t nlen = strlen(e->d_name);
-            if (nlen < 5 || strcmp(e->d_name + nlen - 5, ".sock") ||
-                strncmp(e->d_name, "agentcell-", 10))
-                continue;
-            char base[PATH_MAX], cg[PATH_MAX] = "", line[256];
-            snprintf(base, sizeof base, "%s/%s.info", rt, e->d_name);
-            FILE *f = fopen(base, "r");
-            if (!f) continue;
-            while (fgets(line, sizeof line, f))
-                if (!strncmp(line, "cg=", 3)) {
-                    line[strcspn(line, "\n")] = 0;
-                    snprintf(cg, sizeof cg, "%s", line + 3);
-                    break;
-                }
-            fclose(f);
-            struct stat st;
-            if (cg[0] && !stat(cg, &st)) {
-                cells[ncells].cgid = (__u64)st.st_ino;
-                snprintf(cells[ncells].name, 64, "%s", e->d_name);
-                ncells++;
-            }
-        }
-        closedir(d);
-    }
-    const char *cell_of(__u64 cgid) {
-        for (int i = 0; i < ncells; i++)
-            if (cells[i].cgid == cgid) return cells[i].name;
-        return "?";
-    }
+    struct cellname cells[MAXBIND];
+    int ncells = build_cell_table(cells, MAXBIND);
 
     /* LIST: armed policies */
     int s = lsm_connect();
@@ -1197,7 +1294,7 @@ static int lsm_status(char **av)
             if (!strncmp(p, "END", 3)) goto listed;
             if (sscanf(p, "%llu %255s", &cgid, pfx) == 2)
                 printf("%-10llu %-26s %s\n", cgid,
-                       cell_of(cgid), pfx);
+                       cell_of(cells, ncells, cgid), pfx);
             p = nl + 1;
         }
     }
@@ -1217,7 +1314,7 @@ listed:
             unsigned long long cgid;
             char path[256];
             if (sscanf(p, "EV %llu %255s", &cgid, path) == 2)
-                printf("%s  DENY %s\n", cell_of(cgid), path);
+                printf("%s  DENY %s\n", cell_of(cells, ncells, cgid), path);
             p = nl + 1;
         }
     }
@@ -1352,7 +1449,9 @@ static void usage(FILE *out)
 "  sand serve [options]       start a jailed exec server, prints SOCK\n"
 "  sand exec SOCK [--] CMD..  run CMD inside that jail\n"
 "  sand cells | sand top      list running cells / live view\n"
-"  sand lsm [-f]              LSM policies, live denials (needs agentlsm)\n");
+"  sand lsm [-f]              LSM policies, live denials (needs agentlsm)\n"
+"  sand lsm deny CELL PREFIX..  hot-add deny rule to a RUNNING cell\n"
+"  sand lsm allow CELL PREFIX..  hot-remove; reset CELL: drop all rules\n");
 }
 
 int main(int argc, char **argv)
