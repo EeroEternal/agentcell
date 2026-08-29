@@ -2,3 +2,7 @@ sand
 agentmon
 src/agentmon.bpf.o
 src/agentmon.bpf.h
+agentlsm
+src/agentlsm.bpf.o
+src/agentlsm.bpf.h
+src/vmlinux.h

@@ -32,3 +32,22 @@ clean:
 	rm -f sand agentmon $(BPFOBJ) $(BPFHDR)
 
 .PHONY: all clean
+
+# BPF LSM enforcement (needs root at runtime, bpftool only at build)
+LSMOBJ = src/agentlsm.bpf.o
+LSMHDR = src/agentlsm.bpf.h
+
+agentlsm: src/agentlsm.c $(LSMHDR)
+	$(CC) $(CFLAGS) -include $(LSMHDR) -o $@ src/agentlsm.c -lbpf -lelf -lz
+
+$(LSMOBJ): src/agentlsm.bpf.c src/vmlinux.h
+	$(CLANG) $(BPFFLAGS) -Isrc -c $< -o $@
+
+$(LSMHDR): $(LSMOBJ)
+	xxd -i $< > $@
+	sed -i 's/src_agentlsm_bpf_o/bpf_elf/g' $@
+
+vmlinux.h:
+	bpftool btf dump file /sys/kernel/btf/vmlinux format c > src/vmlinux.h
+
+all: sand agentmon agentlsm
