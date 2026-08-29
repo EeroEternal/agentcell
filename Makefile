@@ -10,7 +10,9 @@ BPFOBJ = src/agentmon.bpf.o
 BPFHDR = src/agentmon.bpf.h
 
 CFLAGS  = -O2 -g -Wall -Wextra -Wno-format-truncation
-BPFFLAGS = -target bpf -D__TARGET_ARCH_x86 -O2 -g
+BPFFLAGS = -target bpf -D__TARGET_ARCH_x86 -O2 -g -idirafter /usr/include/$(shell $(CC) -dumpmachine)
+# -idirafter: clang -target bpf doesn't search gcc's multiarch include dir
+# (asm/types.h lives there on Debian/Ubuntu; harmless if absent, e.g. Arch)
 
 all: sand agentmon
 
