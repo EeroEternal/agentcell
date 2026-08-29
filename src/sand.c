@@ -19,6 +19,7 @@
  *                [--workdir DIR] [--ro DIR]... [--rw DIR]... -- CMD [ARGS]
  */
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -44,6 +45,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAXBIND 32
@@ -152,6 +154,146 @@ static int   g_serve;                 /* 1 = jail stays alive, serves execs */
 static int   g_host_sock = -1;        /* supervisor end of the socketpair   */
 static int   g_jail_sock = -1;        /* jail end, inherited by the child   */
 static char  g_sock_path[PATH_MAX];   /* host-facing unix socket            */
+static char  g_info_path[PATH_MAX];   /* sidecar with cg path, execs, ...   */
+static long  g_execs;
+
+static void write_info(pid_t jail)
+{
+    FILE *f = fopen(g_info_path, "w");
+    if (!f) return;
+    fprintf(f, "sup=%d\njail=%d\nstarted=%ld\ncg=%s\nexecs=%ld\n",
+            (int)getpid(), (int)jail, (long)time(NULL),
+            g_have_cg ? g_cgpath : "-", g_execs);
+    fclose(f);
+}
+
+/* read one line "key value" from a cgroup file like cpu.stat */
+static long cg_stat(const char *cg, const char *file, const char *key)
+{
+    char p[PATH_MAX];
+    snprintf(p, sizeof p, "%s/%s", cg, file);
+    FILE *f = fopen(p, "r");
+    if (!f) return -1;
+    long v = -1;
+    char line[256], k[64];
+    while (fgets(line, sizeof line, f))
+        if (sscanf(line, "%63s %ld", k, &v) == 2 && !strcmp(k, key))
+            break;
+    fclose(f);
+    return v;
+}
+
+static long cg_num(const char *cg, const char *file)
+{
+    char p[PATH_MAX]; long v = -1;
+    snprintf(p, sizeof p, "%s/%s", cg, file);
+    FILE *f = fopen(p, "r");
+    if (f) { if (fscanf(f, "%ld", &v) != 1) v = -1; fclose(f); }
+    return v;
+}
+
+static void fmt_human(long bytes, char *out, size_t n)
+{
+    if (bytes < 0)            snprintf(out, n, "-");
+    else if (bytes < 1<<20)   snprintf(out, n, "%ldK", bytes >> 10);
+    else if (bytes < 1<<30)   snprintf(out, n, "%ldM", bytes >> 20);
+    else                      snprintf(out, n, "%.1fG", bytes / 1073741824.0);
+}
+
+static int cell_info(const char *sock_base, pid_t *sup, pid_t *jail,
+                     long *started, char *cg, size_t cgn, long *execs)
+{
+    char p[PATH_MAX];
+    snprintf(p, sizeof p, "%s.info", sock_base);
+    FILE *f = fopen(p, "r");
+    if (!f) return -1;
+    char line[256];
+    cg[0] = 0;
+    while (fgets(line, sizeof line, f)) {
+        if (!strncmp(line, "sup=", 4))     *sup = atoi(line + 4);
+        else if (!strncmp(line, "jail=", 5))   *jail = atoi(line + 5);
+        else if (!strncmp(line, "started=", 8)) *started = atol(line + 8);
+        else if (!strncmp(line, "cg=", 3)) { line[strcspn(line, "\n")] = 0;
+                                              snprintf(cg, cgn, "%s", line + 3); }
+        else if (!strncmp(line, "execs=", 6))  *execs = atol(line + 6);
+    }
+    fclose(f);
+    return 0;
+}
+
+static int list_cells(void)
+{
+    const char *rt = getenv("XDG_RUNTIME_DIR");
+    if (!rt) rt = "/tmp";
+    DIR *d = opendir(rt);
+    if (!d) { perror(rt); return 1; }
+
+    printf("%-22s %-8s %-9s %-8s %-7s %-7s %s\n",
+           "SOCKET", "SUP", "UPTIME", "EXECS", "CPU(s)", "MEM", "PIDS");
+    struct dirent *e;
+    int found = 0;
+    while ((e = readdir(d))) {
+        size_t nlen = strlen(e->d_name);
+        if (nlen < 5 || strcmp(e->d_name + nlen - 5, ".sock") ||
+            strncmp(e->d_name, "agentcell-", 10))
+            continue;
+        char base[PATH_MAX];
+        snprintf(base, sizeof base, "%s/%s", rt, e->d_name);
+
+        pid_t sup = 0, jail = 0; long started = 0, execs = 0;
+        char cg[PATH_MAX] = "";
+        if (cell_info(base, &sup, &jail, &started, cg, sizeof cg, &execs) < 0)
+            continue;
+        if (kill(sup, 0) < 0 && errno == ESRCH) continue;  /* stale */
+        found++;
+
+        long up = time(NULL) - started;
+        char mem[16];
+        long memc = cg[0] && strcmp(cg, "-") ? cg_num(cg, "memory.current") : -1;
+        fmt_human(memc, mem, sizeof mem);
+        long usec = cg[0] && strcmp(cg, "-") ? cg_stat(cg, "cpu.stat", "usage_usec") : -1;
+        long pids = cg[0] && strcmp(cg, "-") ? cg_num(cg, "pids.current") : -1;
+
+        printf("%-22s %-8d %02ld:%02ld:%02ld %-8ld %-7ld %-7s %ld\n",
+               e->d_name, sup, up / 3600, (up / 60) % 60, up % 60,
+               execs, usec < 0 ? -1 : usec / 1000000, mem, pids);
+    }
+    closedir(d);
+    return found ? 0 : 1;
+}
+
+static int top_cells(const char *sock)
+{
+    char base[PATH_MAX];
+    const char *dot = strstr(sock, ".sock");
+    if (!dot) { fprintf(stderr, "sand: not a cell socket: %s\n", sock); return 2; }
+    snprintf(base, sizeof base, "%.*s", (int)(dot - sock + 5), sock);
+
+    pid_t sup, jail; long started, execs; char cg[PATH_MAX];
+    if (cell_info(base, &sup, &jail, &started, cg, sizeof cg, &execs) < 0) {
+        fprintf(stderr, "sand: no info for %s\n", sock); return 1;
+    }
+    fprintf(stderr, "cell pid %d  cg %s  — Ctrl-C to stop\n\n", jail, cg);
+
+    long prev_usec = 0;
+    for (;;) {
+        long usec = cg_stat(cg, "cpu.stat", "usage_usec");
+        long mem  = cg_num(cg, "memory.current");
+        long pids = cg_num(cg, "pids.current");
+        long memmax = cg_num(cg, "memory.max");
+        long dusec = usec - prev_usec; prev_usec = usec;
+        char mems[16], maxs[16];
+        fmt_human(mem, mems, sizeof mems);
+        fmt_human(memmax, maxs, sizeof maxs);
+        printf("\rcpu %6ldms/s  mem %s/%s  pids %ld  execs %ld    ",
+               dusec / 1000, mems, maxs, pids, execs);
+        fflush(stdout);
+        sleep(1);
+        /* refresh execs from sidecar */
+        cell_info(base, &sup, &jail, &started, cg, sizeof cg, &execs);
+    }
+    return 0;
+}
 
 /* ------------------------------------------------------------------ */
 /* 1. cgroup v2 limits (unprivileged, via systemd's delegated subtree) */
@@ -758,6 +900,9 @@ static void serve_loop(pid_t jail)
         die("listen socket");
     chmod(g_sock_path, 0600);
 
+    snprintf(g_info_path, sizeof g_info_path, "%s.info", g_sock_path);
+    write_info(jail);
+
     fprintf(stderr, "sand: serving %s  (jail pid %d, Ctrl-C to stop)\n",
             g_sock_path, jail);
 
@@ -782,6 +927,8 @@ static void serve_loop(pid_t jail)
             if (c >= 0) {
                 send_fd(g_host_sock, c);
                 close(c);
+                g_execs++;
+                write_info(jail);
             }
         }
         int st;
@@ -792,6 +939,7 @@ static void serve_loop(pid_t jail)
     kill(jail, SIGKILL);
     waitpid(jail, NULL, 0);
     unlink(g_sock_path);
+    unlink(g_info_path);
     fprintf(stderr, "sand: jail stopped\n");
 }
 
@@ -1018,6 +1166,10 @@ int main(int argc, char **argv)
     /* subcommands */
     if (argc > 1 && !strcmp(argv[1], "exec"))
         return client_exec(argv + 2);
+    if (argc > 1 && !strcmp(argv[1], "cells"))
+        return list_cells();
+    if (argc > 1 && !strcmp(argv[1], "top"))
+        return top_cells(argv[2]);
     if (argc > 1 && !strcmp(argv[1], "serve")) {
         g_serve = 1;
         argv++;

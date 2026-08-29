@@ -1,0 +1,28 @@
+name: build
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install deps
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q clang llvm libbpf-dev libelf-dev zlib1g-dev vim-common
+
+      - name: build
+        run: make
+
+      - name: cli smoke test
+        run: |
+          ./sand --help
+          ./agentmon 2>&1 | head -1 || true
+
+      # namespace smoke test: may fail inside the containerized runner
+      # (docker seccomp blocks CLONE_NEWUSER); passes on real systems
+      - name: sandbox smoke test
+        continue-on-error: true
+        run: ./sand -- /bin/true
