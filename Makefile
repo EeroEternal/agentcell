@@ -49,7 +49,7 @@ $(LSMHDR): $(LSMOBJ)
 	xxd -i $< > $@
 	sed -i 's/src_agentlsm_bpf_o/bpf_elf/g' $@
 
-vmlinux.h:
+src/vmlinux.h:
 	bpftool btf dump file /sys/kernel/btf/vmlinux format c > src/vmlinux.h
 
 all: sand agentmon agentlsm
