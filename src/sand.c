@@ -130,6 +130,9 @@ struct cfg {
          binds[MAXBIND]; int n_binds;
     int  no_landlock;
     int  no_seccomp;
+    int  secure;                    /* register with agentlsm daemon */
+    char deny[MAXBIND][256];        /* extra LSM deny prefixes */
+    int  n_deny;
     int  timeout;
     char *const *argv;
 };
@@ -156,14 +159,21 @@ static int   g_jail_sock = -1;        /* jail end, inherited by the child   */
 static char  g_sock_path[PATH_MAX];   /* host-facing unix socket            */
 static char  g_info_path[PATH_MAX];   /* sidecar with cg path, execs, ...   */
 static long  g_execs;
+static __u64 g_lsm_cgid;              /* cell id at the agentlsm daemon    */
+static int   g_lsm_on;
+
+static void lsm_register(void);       /* defined with the exec client code */
+static void lsm_unregister(void);
 
 static void write_info(pid_t jail)
 {
     FILE *f = fopen(g_info_path, "w");
     if (!f) return;
-    fprintf(f, "sup=%d\njail=%d\nstarted=%ld\ncg=%s\nexecs=%ld\n",
+    fprintf(f, "sup=%d\njail=%d\nstarted=%ld\ncg=%s\nexecs=%ld\n"
+               "secure=%d\ncgid=%llu\n",
             (int)getpid(), (int)jail, (long)time(NULL),
-            g_have_cg ? g_cgpath : "-", g_execs);
+            g_have_cg ? g_cgpath : "-", g_execs,
+            C.secure, (unsigned long long)g_lsm_cgid);
     fclose(f);
 }
 
@@ -938,6 +948,7 @@ static void serve_loop(pid_t jail)
 
     kill(jail, SIGKILL);
     waitpid(jail, NULL, 0);
+    lsm_unregister();
     unlink(g_sock_path);
     unlink(g_info_path);
     fprintf(stderr, "sand: jail stopped\n");
@@ -1032,6 +1043,186 @@ static int client_exec(char **av)
     fwrite(rep, 1, len - 4, stdout);
     fflush(stdout);
     return (int)get_u32(rep + len - 4);
+}
+
+/* ------------------------------------------------------------------ */
+/* agentlsm integration: sand --secure registers this cell's cgroup   */
+/* with the root daemon (sudo agentlsm serve) over /run/agentcell/.   */
+/* Denials happen in-kernel at the LSM layer; events stream back to   */
+/* whoever WATCHes the daemon (sand lsm -f).                          */
+/* ------------------------------------------------------------------ */
+
+#define LSM_SOCK "/run/agentcell/lsm.sock"
+
+static int lsm_connect(void)
+{
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un a = { .sun_family = AF_UNIX };
+    snprintf(a.sun_path, sizeof a.sun_path, "%s", LSM_SOCK);
+    if (connect(s, (struct sockaddr *)&a, sizeof a) < 0) {
+        close(s);
+        return -1;
+    }
+    return s;
+}
+
+/* send one command line, read the one-line reply ("OK"/"ERR..."/"END")
+ * — always read it, even if the caller doesn't care: closing first
+ * would turn the daemon's reply write into SIGPIPE/EPIPE */
+static int lsm_cmd(const char *cmd, char *rep, size_t repn)
+{
+    int s = lsm_connect();
+    if (s < 0) return -1;
+    char line[320], scratch[64];
+    snprintf(line, sizeof line, "%s\n", cmd);
+    if (write_full(s, line, strlen(line)) < 0) { close(s); return -1; }
+    if (!rep) { rep = scratch; repn = sizeof scratch; }
+    ssize_t r = read(s, rep, repn - 1);
+    if (r > 0) rep[r] = 0;
+    close(s);
+    return r > 0 ? 0 : -1;
+}
+
+/* arm this cell's policy at the daemon; called after cgroup park */
+static void lsm_register(void)
+{
+    struct stat st;
+    if (stat(g_cgpath, &st) < 0) return;
+    g_lsm_cgid = (__u64)st.st_ino;
+
+    /* defaults keep secrets of the host out of agent reach; note the
+     * prefixes are paths AS SEEN INSIDE the cell (that's what d_path
+     * yields for its bind mounts) */
+    const char *def[2] = { "/etc/shadow", "/etc/gshadow" };
+    int n = C.n_deny ? C.n_deny : 2;
+
+    int s = lsm_connect();
+    if (s < 0) {
+        fprintf(stderr, "sand: --secure: agentlsm daemon not running "
+                        "(sudo agentlsm serve) — LSM enforcement OFF\n");
+        return;
+    }
+
+    int ok = 0;
+    for (int i = 0; i < n; i++) {
+        const char *pfx = C.n_deny ? C.deny[i] : def[i];
+        char cmd[320], rep[64];
+        snprintf(cmd, sizeof cmd, "ADD %llu %s",
+                 (unsigned long long)g_lsm_cgid, pfx);
+        if (write_full(s, cmd, strlen(cmd)) || write_full(s, "\n", 1) ||
+            read(s, rep, sizeof rep - 1) <= 0 || strncmp(rep, "OK", 2))
+            { close(s); fprintf(stderr, "sand: agentlsm ADD failed\n"); return; }
+        ok++;
+    }
+    close(s);
+    g_lsm_on = 1;
+    fprintf(stderr, "sand: LSM armed: %d deny prefix%s via agentlsm "
+                    "(cgid %llu)\n", ok, ok == 1 ? "" : "es",
+                    (unsigned long long)g_lsm_cgid);
+}
+
+static void lsm_unregister(void)
+{
+    if (!g_lsm_on) return;
+    g_lsm_on = 0;
+    char cmd[64];
+    snprintf(cmd, sizeof cmd, "CLR %llu", (unsigned long long)g_lsm_cgid);
+    lsm_cmd(cmd, NULL, 0);
+}
+
+/* sand lsm [-f]: enforcement status, and live denial events.
+ * cgroup ids are resolved to cell names via the *.info sidecars. */
+static int lsm_status(char **av)
+{
+    setvbuf(stdout, NULL, _IOLBF, 0);   /* live events, flush per line */
+    int follow = av[0] && (!strcmp(av[0], "-f") || !strcmp(av[0], "--follow"));
+
+    /* build cgid -> cell-name table from running cells */
+    struct { __u64 cgid; char name[64]; } cells[MAXBIND];
+    int ncells = 0;
+    const char *rt = getenv("XDG_RUNTIME_DIR");
+    if (!rt) rt = "/tmp";
+    DIR *d = opendir(rt);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) && ncells < MAXBIND) {
+            size_t nlen = strlen(e->d_name);
+            if (nlen < 5 || strcmp(e->d_name + nlen - 5, ".sock") ||
+                strncmp(e->d_name, "agentcell-", 10))
+                continue;
+            char base[PATH_MAX], cg[PATH_MAX] = "", line[256];
+            snprintf(base, sizeof base, "%s/%s.info", rt, e->d_name);
+            FILE *f = fopen(base, "r");
+            if (!f) continue;
+            while (fgets(line, sizeof line, f))
+                if (!strncmp(line, "cg=", 3)) {
+                    line[strcspn(line, "\n")] = 0;
+                    snprintf(cg, sizeof cg, "%s", line + 3);
+                    break;
+                }
+            fclose(f);
+            struct stat st;
+            if (cg[0] && !stat(cg, &st)) {
+                cells[ncells].cgid = (__u64)st.st_ino;
+                snprintf(cells[ncells].name, 64, "%s", e->d_name);
+                ncells++;
+            }
+        }
+        closedir(d);
+    }
+    const char *cell_of(__u64 cgid) {
+        for (int i = 0; i < ncells; i++)
+            if (cells[i].cgid == cgid) return cells[i].name;
+        return "?";
+    }
+
+    /* LIST: armed policies */
+    int s = lsm_connect();
+    if (s < 0) {
+        fprintf(stderr, "sand: agentlsm daemon not running "
+                        "(start it: sudo agentlsm serve)\n");
+        return 1;
+    }
+    write_full(s, "LIST\n", 5);
+    char lrep[320];
+    ssize_t r;
+    printf("%-10s %-26s %s\n", "CGID", "CELL", "DENY PREFIX");
+    while ((r = read(s, lrep, sizeof lrep - 1)) > 0) {
+        lrep[r] = 0;
+        char *p = lrep, *nl;
+        while ((nl = strchr(p, '\n'))) {
+            *nl = 0;
+            unsigned long long cgid;
+            char pfx[256];
+            if (!strncmp(p, "END", 3)) goto listed;
+            if (sscanf(p, "%llu %255s", &cgid, pfx) == 2)
+                printf("%-10llu %-26s %s\n", cgid,
+                       cell_of(cgid), pfx);
+            p = nl + 1;
+        }
+    }
+listed:
+    if (!follow) { close(s); return 0; }
+
+    /* WATCH: stream denial events, resolving cgid -> cell */
+    printf("-- following LSM denials (Ctrl-C to stop) --\n");
+    write_full(s, "WATCH\n", 6);
+    for (;;) {
+        ssize_t n = read(s, lrep, sizeof lrep - 1);
+        if (n <= 0) break;
+        lrep[n] = 0;
+        char *p = lrep, *nl;
+        while ((nl = strchr(p, '\n'))) {
+            *nl = 0;
+            unsigned long long cgid;
+            char path[256];
+            if (sscanf(p, "EV %llu %255s", &cgid, path) == 2)
+                printf("%s  DENY %s\n", cell_of(cgid), path);
+            p = nl + 1;
+        }
+    }
+    close(s);
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1151,11 +1342,17 @@ static void usage(FILE *out)
 "  --bind S:D    mount host path S at path D inside the sandbox (rw)\n"
 "  --bind-ro S:D same, but read-only\n"
 "  --timeout S   kill payload after S seconds\n"
+"  --secure      arm kernel LSM policy via the agentlsm daemon\n"
+"                (deny /etc/shadow & /etc/gshadow by default)\n"
+"  --deny PREFIX extra LSM deny prefix (repeatable, implies --secure;\n"
+"                paths as seen INSIDE the sandbox, e.g. /mnt/NAME)\n"
 "  --no-landlock | --no-seccomp   debug switches\n"
 "\n"
 "long-running mode (isolation set up once, then reused):\n"
 "  sand serve [options]       start a jailed exec server, prints SOCK\n"
-"  sand exec SOCK [--] CMD..  run CMD inside that jail\n");
+"  sand exec SOCK [--] CMD..  run CMD inside that jail\n"
+"  sand cells | sand top      list running cells / live view\n"
+"  sand lsm [-f]              LSM policies, live denials (needs agentlsm)\n");
 }
 
 int main(int argc, char **argv)
@@ -1170,6 +1367,8 @@ int main(int argc, char **argv)
         return list_cells();
     if (argc > 1 && !strcmp(argv[1], "top"))
         return top_cells(argv[2]);
+    if (argc > 1 && !strcmp(argv[1], "lsm"))
+        return lsm_status(argv + 2);
     if (argc > 1 && !strcmp(argv[1], "serve")) {
         g_serve = 1;
         argv++;
@@ -1199,6 +1398,8 @@ int main(int argc, char **argv)
         {"bind",        required_argument, 0, 'b'},
         {"bind-ro",     required_argument, 0, 'B'},
         {"timeout",     required_argument, 0, 't'},
+        {"secure",      no_argument, &C.secure, 1},
+        {"deny",        required_argument, 0, 'd'},
         {"no-landlock", no_argument, &C.no_landlock, 1},
         {"no-seccomp",  no_argument, &C.no_seccomp, 1},
         {"help",        no_argument, 0, 'h'},
@@ -1245,6 +1446,13 @@ int main(int argc, char **argv)
             break;
         }
         case 't': C.timeout = atoi(optarg); break;
+        case 'd':
+            if (C.n_deny < MAXBIND) {
+                snprintf(C.deny[C.n_deny], 256, "%s", optarg);
+                C.n_deny++;
+            }
+            C.secure = 1;               /* --deny implies --secure */
+            break;
         case 'h': usage(stdout); return 0;
         case 0: break;
         default: usage(stderr); return 2;
@@ -1312,6 +1520,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "sand: pid %d  cgroup %s\n", pid, g_cgpath);
     }
 
+    if (C.secure && g_have_cg)
+        lsm_register();
+
     if (write(g_sync[1], "x", 1) < 0) warn2("sync child");
 
     if (g_serve)
@@ -1334,6 +1545,7 @@ int main(int argc, char **argv)
     }
 
     if (g_have_cg) rmdir(g_cgpath);
+    lsm_unregister();
     rmdir(g_newroot);
 
     if (WIFEXITED(status))

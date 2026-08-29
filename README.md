@@ -132,6 +132,50 @@ so every denial lands in the kernel audit log (`type=1326` records) —
 `--audit` tails that stream. Bonus detail it reveals: util-linux `mount`
 tries the new mount API (`fsopen`) before `mount(2)`.
 
+## Kernel LSM enforcement (agentlsm, root daemon)
+
+Below seccomp and Landlock there is one more layer: a **BPF LSM program
+on `lsm/file_open`** that denies opens in-kernel, per sandbox cgroup,
+by path prefix. Unlike Landlock (self-imposed, per-process), it is
+imposed from outside and centrally managed — the sandboxed process
+cannot see or turn it off.
+
+```bash
+# terminal 1: the daemon (once per boot; root)
+sudo ./agentlsm serve
+
+# terminal 2: launch a sandbox registered with the daemon.
+# --secure denies /etc/shadow + /etc/gshadow by default;
+# --deny adds prefixes (as seen INSIDE the sandbox) and implies --secure
+./sand --secure -- claude
+./sand --deny /mnt/secrets -- claude
+
+# terminal 3: policies + live denials, no root needed
+./sand lsm        # table of armed policies, resolved to cell names
+./sand lsm -f     # live: cell-x.sock  DENY /etc/shadow
+```
+
+Cells register on start and unregister on exit; if the daemon is down,
+`sand` prints a warning and runs without the LSM layer (fail-open for
+availability — mount RO + Landlock still apply).
+
+One-shot debug modes (verified end-to-end):
+
+```bash
+sudo ./agentlsm --cgroup /sys/fs/cgroup/.../agentcell-<PID> --deny /etc/shadow
+sudo ./agentlsm --any-cgroup --deny /etc/hostname   # no cgroup filter
+sudo ./agentlsm --block-all 3    # decisive test: deny EVERY open
+                                  # system-wide 3s, kernel-side deadline
+```
+
+`--block-all` denied 121,190 opens in 3s and self-expired within ~1 ms
+of schedule — the mechanism used to prove the attach path works when
+filtered policies mysteriously "didn't" (they did; the test was wrong).
+
+Trust model: the control socket is 0666 — any local user can register
+policy for any cgroup id. Fine on a single-user workstation; needs peer
+credentials + an allowlist before multi-user use.
+
 ## Measured performance
 
 On an old i5-4210U (2C/4T), Arch kernel 7.1.9:

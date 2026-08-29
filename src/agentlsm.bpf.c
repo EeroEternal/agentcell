@@ -27,7 +27,7 @@
 #define ACT_ALLOW 1
 #define ACT_DENY   2
 
-/* prefix -> action; longest matching prefix wins */
+/* prefix -> action; longest matching prefix wins (one-shot modes) */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 128);
@@ -35,7 +35,35 @@ struct {
     __type(value, __u32);
 } policy SEC(".maps");
 
+/* ---- serve mode (agentlsm serve): per-cell policies ----
+ *
+ * Each registered sandbox cgroup gets an entry in `cells` (this is the
+ * cheap short-circuit: opens from the other ~10k processes on the
+ * system cost ONE hash lookup) and per-prefix rules in `cellpol`,
+ * keyed by {cgid, prefix}.  A DENY match enforces -EPERM and emits an
+ * event (enforcement + visibility together).
+ */
+struct cellkey {
+    __u64 cgid;
+    char prefix[PLEN];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, __u64);
+    __type(value, __u32);
+} cells SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, struct cellkey);
+    __type(value, __u32);
+} cellpol SEC(".maps");
+
 struct evt {
+    __u64 cgid;
     char path[PLEN];
 };
 
@@ -47,6 +75,12 @@ struct {
 /* set from userspace: 0 = audit only (log, allow) */
 const volatile __u64 target_cgid = 0;
 const volatile int enforce = 0;
+/* MODE_SERVE: only the map-driven per-cell path runs.
+ * MODE_FLAT:  the one-shot flat policy path runs (target_cgid may
+ *             still be 0 = match every cgroup). */
+#define MODE_SERVE 0
+#define MODE_FLAT  1
+const volatile int mode = MODE_SERVE;
 
 /*
  * Decisive-experiment mode (--block-all N): deny EVERY file_open,
@@ -69,11 +103,49 @@ int BPF_PROG(cell_file_open, struct file *file)
         return 0;
     }
 
-    if (target_cgid) {
-        __u64 cgid = bpf_get_current_cgroup_id();
-        if (cgid != target_cgid)
+    __u64 cgid = bpf_get_current_cgroup_id();
+
+    /* ---- serve mode: registered cell? (one lookup for everyone else) */
+    if (bpf_map_lookup_elem(&cells, &cgid)) {
+        char path[PLEN];
+        long n = bpf_d_path(&file->f_path, path, sizeof(path));
+        if (n < 0)
             return 0;
+
+        int plen = 0;
+        for (; plen < PLEN - 1 && path[plen]; plen++)
+            ;
+
+        for (int len = plen; len > 0; len--) {
+            struct cellkey k = {0};
+            k.cgid = cgid;
+            for (int j = 0; j < PLEN - 1; j++) {
+                if (j >= len) break;   /* blocks loop->memcpy conversion */
+                k.prefix[j] = path[j];
+            }
+            __u32 *act = bpf_map_lookup_elem(&cellpol, &k);
+            if (act) {
+                if (*act == ACT_DENY) {
+                    struct evt *e = bpf_ringbuf_reserve(&events,
+                                                         sizeof(*e), 0);
+                    if (e) {
+                        e->cgid = cgid;
+                        __builtin_memcpy(e->path, path, sizeof(e->path));
+                        bpf_ringbuf_submit(e, 0);
+                    }
+                    return -EPERM;
+                }
+                break;   /* longest match: explicit allow */
+            }
+        }
+        return 0;
     }
+
+    /* ---- one-shot modes (--cgroup / --any-cgroup) ---- */
+    if (mode != MODE_FLAT)
+        return 0;
+    if (target_cgid && cgid != target_cgid)
+        return 0;
 
     char path[PLEN];
     long n = bpf_d_path(&file->f_path, path, sizeof(path));
@@ -106,6 +178,7 @@ int BPF_PROG(cell_file_open, struct file *file)
             return -EPERM;      /* kernel-level denial */
         struct evt *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
         if (e) {
+            e->cgid = cgid;
             __builtin_memcpy(e->path, path, sizeof(e->path));
             bpf_ringbuf_submit(e, 0);
         }
