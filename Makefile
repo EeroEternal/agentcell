@@ -52,4 +52,9 @@ $(LSMHDR): $(LSMOBJ)
 src/vmlinux.h:
 	bpftool btf dump file /sys/kernel/btf/vmlinux format c > src/vmlinux.h
 
+check: all
+	tests/run.sh
+
 all: sand agentmon agentlsm
+
+.PHONY: all clean check
