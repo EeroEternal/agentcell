@@ -83,11 +83,15 @@ const volatile int enforce = 0;
 const volatile int mode = MODE_SERVE;
 
 /*
- * Decisive-experiment mode (--block-all N): deny EVERY file_open,
- * system-wide, until this monotonic ktime.  Time-bounded in the
- * kernel, so even if the loader is killed the denial self-expires.
+ * Decisive-experiment mode (--block-all N): deny EVERY file_open
+ * until this monotonic ktime.  Time-bounded in the kernel, so even
+ * if the loader is killed the denial self-expires.  Scoped to
+ * block_cgid when set; 0 = system-wide — a deliberate debug hammer
+ * that EPERMs every process on the machine, including the shell or
+ * agent harness that launched it.
  */
 const volatile __u64 block_until_ns = 0;
+const volatile __u64 block_cgid = 0;
 
 /* bpf_d_path kfunc is declared by vmlinux.h on modern kernels */
 
@@ -97,9 +101,13 @@ SEC("lsm/file_open")
 int BPF_PROG(cell_file_open, struct file *file)
 {
     if (block_until_ns) {
-        /* block-all window: ignore cgroup and policy entirely */
-        if (bpf_ktime_get_ns() < block_until_ns)
-            return -EPERM;
+        /* block-all window: policy maps ignored; scoped to block_cgid
+         * when set (0 = system-wide) */
+        if (bpf_ktime_get_ns() < block_until_ns) {
+            if (!block_cgid ||
+                bpf_get_current_cgroup_id() == block_cgid)
+                return -EPERM;
+        }
         return 0;
     }
 

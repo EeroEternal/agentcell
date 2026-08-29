@@ -170,8 +170,12 @@ One-shot debug modes (verified end-to-end):
 ```bash
 sudo ./agentlsm --cgroup /sys/fs/cgroup/.../agentcell-<PID> --deny /etc/shadow
 sudo ./agentlsm --any-cgroup --deny /etc/hostname   # no cgroup filter
-sudo ./agentlsm --block-all 3    # decisive test: deny EVERY open
-                                  # system-wide 3s, kernel-side deadline
+# decisive test: deny EVERY open in one cell for 1s, kernel-side deadline
+sudo ./agentlsm --block-all 1 --cgroup /sys/fs/cgroup/.../agentcell-<PID>
+# system-wide variant (--block-all 3 without --cgroup) denies EVERY open
+# on the machine for 3s — including your shell, desktop and any agent
+# harness. Manual debugging only; `make check` skips it unless
+# AGENTCELL_TEST_BLOCK_ALL_GLOBAL=1 is set.
 ```
 
 `--block-all` denied 121,190 opens in 3s and self-expired within ~1 ms

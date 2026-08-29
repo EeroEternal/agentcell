@@ -5,7 +5,10 @@
  * One-shot modes (debugging / bisect):
  *   sudo ./agentlsm --cgroup PATH [--deny PREFIX]... [--audit]
  *   sudo ./agentlsm --any-cgroup [--deny PREFIX]...
- *   sudo ./agentlsm --block-all SECONDS   deny every open, system-wide
+ *   sudo ./agentlsm --block-all SECONDS [--cgroup PATH]
+ *                     deny every open — scoped to PATH's cgroup when
+ *                     given, system-wide otherwise (DANGER: EPERMs
+ *                     every process, incl. your shell/agent harness)
  *
  * Daemon mode (the real thing):
  *   sudo ./agentlsm serve
@@ -60,21 +63,23 @@ static struct bpf_link   *g_link;
 static int g_fd_policy, g_fd_cells, g_fd_cellpol, g_fd_events;
 
 static int bpf_load_attach(__u64 target_cgid, int enforce,
-                           __u64 block_until_ns, int mode)
+                           __u64 block_until_ns, __u64 block_cgid, int mode)
 {
     libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 
     struct bpf_object *obj = bpf_object__open_mem(bpf_elf, bpf_elf_len, NULL);
     if (!obj) { fprintf(stderr, "agentlsm: open failed\n"); return -1; }
 
-    /* rodata layout: target_cgid@0, enforce@8, mode@12, block_until@16 */
+    /* rodata layout: target_cgid@0, enforce@8, mode@12,
+     * block_until@16, block_cgid@24 */
     struct {
         __u64 target_cgid;
         int  enforce;
         int  mode;
         __u64 block_until_ns;
+        __u64 block_cgid;
     } __attribute__((packed)) cfg = { target_cgid, enforce, mode,
-                                      block_until_ns };
+                                      block_until_ns, block_cgid };
 
     struct bpf_map *ro = bpf_object__find_map_by_name(obj, ".rodata");
     if (!ro || bpf_map__set_initial_value(ro, &cfg, sizeof cfg)) {
@@ -247,7 +252,7 @@ static int serve_mode(void)
         fprintf(stderr, "agentlsm: serve must run as root\n");
         return 1;
     }
-    if (bpf_load_attach(0, 1, 0, 0 /* MODE_SERVE */)) return 1;
+    if (bpf_load_attach(0, 1, 0, 0, 0 /* MODE_SERVE */)) return 1;
 
     mkdir("/run/agentcell", 0755);
     unlink(LSM_SOCK);
@@ -370,7 +375,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "usage: %s serve\n"
                             "       %s --cgroup PATH [--deny PREFIX]... "
                             "[--audit] [--any-cgroup]\n"
-                            "       %s --block-all SECONDS\n",
+                            "       %s --block-all SECONDS [--cgroup PATH]\n",
                     argv[0], argv[0], argv[0]);
             return 2;
         }
@@ -394,8 +399,40 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    if (block_all) {
+        /* time-bounded deny-everything window, kernel-side deadline.
+         * Scoped to --cgroup when given — the system-wide variant
+         * EPERMs EVERY process on the machine, including the shell,
+         * desktop or agent harness that launched it. */
+        __u64 bcgid = (cgroup && !anycg) ? (__u64)st.st_ino : 0;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        __u64 until = (__u64)now.tv_sec * 1000000000ULL + now.tv_nsec
+                    + (__u64)(block_all * 1e9) + 500000000ULL;
+        if (bpf_load_attach(0, 0, until, bcgid, 0)) return 1;
+
+        if (!bcgid)
+            fprintf(stderr, "agentlsm: WARNING: no --cgroup — EVERY open "
+                            "system-wide will fail for %.1fs\n", block_all);
+        printf("agentlsm: BLOCK-ALL armed%s: opens DENIED for %.1fs "
+               "(0.5s grace), kernel-side deadline, then auto-detach\n",
+               bcgid ? " (cgroup-scoped)" : "", block_all);
+        fflush(stdout);
+        double total = 0.5 + block_all;
+        while (total > 0 && !g_stop) {
+            double step = total > 0.25 ? 0.25 : total;
+            struct timespec ts = { (time_t)step,
+                (long)((step - (time_t)step) * 1e9) };
+            nanosleep(&ts, NULL);
+            total -= step;
+        }
+        bpf_detach();
+        printf("agentlsm: window over, detached\n");
+        return 0;
+    }
+
     if (bpf_load_attach((cgroup && !anycg) ? (__u64)st.st_ino : 0,
-                        !audit, 0, 1 /* MODE_FLAT */))
+                        !audit, 0, 0, 1 /* MODE_FLAT */))
         return 1;
 
     if (n_deny == 0) {
@@ -411,31 +448,6 @@ int main(int argc, char **argv)
                     strerror(errno));
             return 1;
         }
-    }
-
-    if (block_all) {
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        __u64 until = (__u64)now.tv_sec * 1000000000ULL + now.tv_nsec
-                    + (__u64)(block_all * 1e9) + 500000000ULL;
-        bpf_detach();
-        if (bpf_load_attach(0, 0, until, 0)) return 1;
-
-        printf("agentlsm: BLOCK-ALL armed: opens DENIED for %.1fs "
-               "(0.5s grace), kernel-side deadline, then auto-detach\n",
-               block_all);
-        fflush(stdout);
-        double total = 0.5 + block_all;
-        while (total > 0 && !g_stop) {
-            double step = total > 0.25 ? 0.25 : total;
-            struct timespec ts = { (time_t)step,
-                (long)((step - (time_t)step) * 1e9) };
-            nanosleep(&ts, NULL);
-            total -= step;
-        }
-        bpf_detach();
-        printf("agentlsm: window over, detached\n");
-        return 0;
     }
 
     printf("agentlsm: enforcing=%d cgid=%llu deny-list:\n", !audit,
