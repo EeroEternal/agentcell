@@ -26,6 +26,11 @@
  *                              lines; classes: deny,exec,open,net,trip
  *                              (comma-separated, default all)
  *
+ *       NETUP <pid>           build a veth pair + NAT for the cell whose
+ *                              jail pid is <pid>; replies
+ *                              "OK <ifname> <cell-ip> <gw-ip>"
+ *       NETDOWN <pid>          tear it down (frees the /30)
+ *
  *     Denials are enforced (-EPERM) AND reported to watchers.  The
  *     daemon also carries agentmon's tracepoint probes (exec / open /
  *     connect) plus a raw_syscalls/sys_exit probe for TRIP events —
@@ -41,6 +46,7 @@
 #include <bpf/libbpf.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -259,6 +265,120 @@ static int on_evt(void *ctx, void *data, size_t size)
     return 0;
 }
 
+/* ---- veth + NAT provisioning (sand --net veth) -----------------------
+ * The sandbox is unprivileged; veth pairs and NAT are not.  The cell's
+ * parent asks over the control socket: NETUP builds a pair, pushes one
+ * end into the cell's netns, assigns a /30 out of 10.200.0.0/16 and
+ * makes sure NAT exists; NETDOWN tears it down.  Everything the daemon
+ * touches (veth ends, iptables rules, ip_forward) is reversed on exit.
+ */
+static __u64 g_netmap[256];                    /* 16384 /30s, one bit each */
+static struct { pid_t pid; int idx; } g_nets[64];
+static int   g_nat_on;
+static int   g_fwd_save = -1;
+
+static int sh(const char *fmt, ...)
+{
+    char cmd[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(cmd, sizeof cmd, fmt, ap);
+    va_end(ap);
+    return system(cmd);
+}
+
+static void nat_ensure(void)
+{
+    if (g_nat_on) return;
+    FILE *f = fopen("/proc/sys/net/ipv4/ip_forward", "r");
+    if (f) { if (fscanf(f, "%d", &g_fwd_save) != 1) g_fwd_save = -1; fclose(f); }
+    f = fopen("/proc/sys/net/ipv4/ip_forward", "w");
+    if (f) { fputs("1\n", f); fclose(f); }
+    sh("iptables -t nat -C POSTROUTING -s 10.200.0.0/16 -j MASQUERADE 2>/dev/null"
+       " || iptables -t nat -A POSTROUTING -s 10.200.0.0/16 -j MASQUERADE");
+    sh("iptables -C FORWARD -s 10.200.0.0/16 -j ACCEPT 2>/dev/null"
+       " || iptables -I FORWARD -s 10.200.0.0/16 -j ACCEPT");
+    sh("iptables -C FORWARD -d 10.200.0.0/16 -j ACCEPT 2>/dev/null"
+       " || iptables -I FORWARD -d 10.200.0.0/16 -j ACCEPT");
+    g_nat_on = 1;
+}
+
+static void nat_teardown(void)
+{
+    if (!g_nat_on) return;
+    g_nat_on = 0;
+    sh("iptables -t nat -D POSTROUTING -s 10.200.0.0/16 -j MASQUERADE 2>/dev/null");
+    sh("iptables -D FORWARD -s 10.200.0.0/16 -j ACCEPT 2>/dev/null");
+    sh("iptables -D FORWARD -d 10.200.0.0/16 -j ACCEPT 2>/dev/null");
+    if (g_fwd_save >= 0) {
+        FILE *f = fopen("/proc/sys/net/ipv4/ip_forward", "w");
+        if (f) { fprintf(f, "%d\n", g_fwd_save); fclose(f); }
+    }
+}
+
+static int net_up(pid_t pid, char *rep, size_t repn)
+{
+    int slot = -1;
+    for (int i = 0; i < 64; i++)
+        if (!g_nets[i].pid) { slot = i; break; }
+    if (slot < 0) return -1;
+
+    int idx = -1;
+    for (int i = 0; i < 16384; i++)
+        if (!(g_netmap[i >> 6] & (1ULL << (i & 63)))) {
+            g_netmap[i >> 6] |= 1ULL << (i & 63);
+            idx = i;
+            break;
+        }
+    if (idx < 0) return -1;
+
+    /* b = idx*4: 10.200.<b+1>/30 host end, 10.200.<b+2> cell end */
+    unsigned b = idx * 4;
+    if (sh("ip link add vethh%d type veth peer name vethc%d 2>/dev/null",
+           idx, idx)) {
+        sh("ip link del vethh%d 2>/dev/null", idx);   /* stale from a crash */
+        if (sh("ip link add vethh%d type veth peer name vethc%d", idx, idx))
+            goto fail;
+    }
+    if (sh("ip link set vethc%d netns %d", idx, (int)pid))
+        { sh("ip link del vethh%d 2>/dev/null", idx); goto fail; }
+    if (sh("ip addr add 10.200.%u.%u/30 dev vethh%d",
+           (b + 1) >> 8, (b + 1) & 255, idx))
+        { sh("ip link del vethh%d 2>/dev/null", idx); goto fail; }
+    if (sh("ip link set vethh%d up", idx))
+        { sh("ip link del vethh%d 2>/dev/null", idx); goto fail; }
+
+    nat_ensure();
+    g_nets[slot].pid = pid;
+    g_nets[slot].idx = idx;
+    snprintf(rep, repn, "OK vethc%d 10.200.%u.%u 10.200.%u.%u\n",
+             idx, (b + 2) >> 8, (b + 2) & 255, (b + 1) >> 8, (b + 1) & 255);
+    return 0;
+fail:
+    g_netmap[idx >> 6] &= ~(1ULL << (idx & 63));
+    return -1;
+}
+
+static void net_down(pid_t pid)
+{
+    for (int i = 0; i < 64; i++) {
+        if (g_nets[i].pid != pid) continue;
+        sh("ip link del vethh%d 2>/dev/null", g_nets[i].idx);
+        g_netmap[g_nets[i].idx >> 6] &= ~(1ULL << (g_nets[i].idx & 63));
+        g_nets[i].pid = 0;
+    }
+}
+
+static void net_cleanup_all(void)
+{
+    for (int i = 0; i < 64; i++)
+        if (g_nets[i].pid) {
+            sh("ip link del vethh%d 2>/dev/null", g_nets[i].idx);
+            g_nets[i].pid = 0;
+        }
+    nat_teardown();
+}
+
 static int cell_add(__u64 cgid, const char *prefix)
 {
     struct { __u64 cgid; char prefix[PLEN]; } k = {0};
@@ -346,6 +466,18 @@ static void serve_line(int ci, char *line)
         }
         g_conn[ci].watcher = 1;
         g_conn[ci].mask = mask ? mask : ~0u;
+        snprintf(rep, sizeof rep, "OK\n");
+    } else if (!strncmp(line, "NETUP ", 6)) {
+        long pid;
+        if (sscanf(line + 6, "%ld", &pid) == 1 &&
+            !net_up((pid_t)pid, rep, sizeof rep))
+            ;                                   /* net_up filled rep */
+        else
+            snprintf(rep, sizeof rep, "ERR netup\n");
+    } else if (!strncmp(line, "NETDOWN ", 8)) {
+        long pid;
+        if (sscanf(line + 8, "%ld", &pid) == 1)
+            net_down((pid_t)pid);
         snprintf(rep, sizeof rep, "OK\n");
     } else if (!strcmp(line, "QUIT") || !strcmp(line, "BYE")) {
         conn_drop(ci);
@@ -446,6 +578,7 @@ static int serve_mode(void)
     }
 
     ring_buffer__free(rb);
+    net_cleanup_all();
     for (int i = 0; i < MAX_WATCH; i++)
         if (g_conn[i].fd >= 0) conn_drop(i);
     close(lfd);

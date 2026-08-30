@@ -76,6 +76,34 @@ Inside the sandbox: workspace is `/home/agent` (rw, `~/agent-work` on the
 host), scratch is `/tmp` (tmpfs — RAM speed), full toolchain read-only at
 `/usr`, host files don't exist at all.
 
+## Real networking (`--net veth`)
+
+`--net none` gives loopback only; `--net host` shares the host's stack
+entirely.  `--net veth` is the middle ground: the cell gets its own
+stack with a veth pair and NAT — real outbound networking, no shared
+interfaces.
+
+veth pairs and NAT need host root, so this mode is provisioned by the
+**agentlsm daemon** (`sudo agentlsm serve`, same one as `--secure`):
+
+```bash
+./sand --net veth -- curl -sI https://example.com
+# cell side: vethc<i> 10.200.x.2/30, default via 10.200.x.1 (host end)
+# host side: vethh<i>, MASQUERADE for 10.200.0.0/16, ip_forward
+```
+
+The daemon allocates a /30 per cell out of 10.200.0.0/16, pushes one
+end into the cell's netns, and adds the NAT/FORWARD rules once; the
+cell configures its own end with plain ioctls (no iproute2 inside).
+Everything is reversed when the cell exits (veth deleted, /30 freed)
+and when the daemon exits (rules removed, ip_forward restored).
+DNS works: `/etc/resolv.conf`'s loopback stub is unreachable from a
+netns, so the cell gets systemd-resolved's upstream list instead.
+
+Notes: needs `iproute2` + `iptables` on the host; the cell can reach
+the host at the gateway IP (same model as a Docker bridge); without
+the daemon, `--net veth` warns and falls back to `--net none`.
+
 ## Long-running mode (cell server)
 
 Each one-shot sandbox costs ~5 ms to build — negligible for one agent,
@@ -274,7 +302,6 @@ and a 1G tmpfs scratch.
 
 - **BPF LSM hooks** (needs `bpf` in the LSM list): enforce policy
   in-kernel on `file_open` / `bprm_check_security` instead of auditing.
-- **veth + NAT** for real (non-host-shared) network access.
 - **long-lived cell**: keep one sandbox alive, stream commands over a
   unix socket, amortize all setup cost to zero.
 - `io.max` for disk rate limiting; overlayfs upperdir for disposable roots.

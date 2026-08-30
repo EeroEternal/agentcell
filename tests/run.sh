@@ -247,6 +247,14 @@ if lsmok; then
     if ./sand lsm | grep -q "$NAME"; then fail "auto-CLR on cell exit"
     else pass "auto-CLR on cell exit"; fi
 
+    # veth + NAT: real networking provisioned by the daemon
+    t_out "veth addr configured" "inet 10\.200\." \
+          ./sand --net veth -- ip -4 addr show
+    t_out "veth default route" "default via 10\.200\." \
+          ./sand --net veth -- ip route show
+    t_out "veth NAT + DNS outbound" "HTTP" \
+          ./sand --net veth -- curl -sI --max-time 5 https://example.com
+
     # block-all, scoped to a throwaway cell: kernel-side time-bounded
     # deny-everything window.  The SYSTEM-WIDE variant is intentionally
     # not run here — it EPERMs every open on the machine, including the

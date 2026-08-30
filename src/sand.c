@@ -32,6 +32,8 @@
 #include <linux/landlock.h>
 #include <linux/seccomp.h>
 #include <net/if.h>
+#include <net/route.h>
+#include <arpa/inet.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdint.h>
@@ -97,6 +99,22 @@ static void mmkdir_p(const char *path, mode_t m)
     mmkdir(tmp, m);
 }
 
+/* textual absolute-path normalizer: collapses "." and ".." segments
+ * (no symlink resolution — the host's paths are about to vanish) */
+static void normalize_path(char *path)
+{
+    char *seg[128], out[PATH_MAX] = "";
+    int n = 0;
+    for (char *tok = strtok(path, "/"); tok && n < 128; tok = strtok(NULL, "/")) {
+        if (!strcmp(tok, ".")) continue;
+        if (!strcmp(tok, "..")) { if (n) n--; continue; }
+        seg[n++] = tok;
+    }
+    for (int i = 0; i < n; i++) { strcat(out, "/"); strcat(out, seg[i]); }
+    if (!n) strcpy(out, "/");
+    strcpy(path, out);          /* never longer than the input */
+}
+
 static void bind_mount(const char *src, const char *dst, int ro, int rec)
 {
     unsigned long fl = MS_BIND | (rec ? MS_REC : 0);
@@ -107,8 +125,11 @@ static void bind_mount(const char *src, const char *dst, int ro, int rec)
     }
     if (ro)
         if (mount(NULL, dst, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY |
-                  (rec ? MS_REC : 0), NULL) < 0)
-            die("remount ro");
+                  (rec ? MS_REC : 0), NULL) < 0) {
+            char msg[PATH_MAX * 2];
+            snprintf(msg, sizeof msg, "remount ro %s", dst);
+            die(msg);
+        }
 }
 
 static void tmpfs_mount(const char *dst, const char *opts)
@@ -121,11 +142,14 @@ static void tmpfs_mount(const char *dst, const char *opts)
 /* config                                                              */
 /* ------------------------------------------------------------------ */
 
+enum { NET_NONE, NET_HOST, NET_VETH };
+
 struct cfg {
     long mem_bytes;
     char cpu_max[64];
     int  pids;
-    int  net_none;
+    int  netmode;                   /* NET_NONE | NET_HOST | NET_VETH */
+    char veth_if[64], veth_ip[64], veth_gw[64];   /* --net veth */
     char workdir[PATH_MAX];
     char *ro[MAXBIND]; int n_ro;
     char *rw[MAXBIND]; int n_rw;
@@ -145,7 +169,7 @@ static struct cfg C = {
     .mem_bytes = 2L << 30,
     .cpu_max   = "200000 100000",
     .pids      = 256,
-    .net_none  = 1,
+    .netmode  = NET_NONE,
     .workdir   = "",
 };
 
@@ -155,6 +179,7 @@ static int   g_sync[2];              /* parent -> child: uid maps ready */
 static char  g_newroot[] = "/tmp/agentcell-root.XXXXXX";
 static char  g_cgpath[PATH_MAX];
 static int   g_have_cg;
+static int   g_veth_on;              /* NETUP succeeded: NETDOWN at exit */
 
 /* ---- long-running (serve) mode ---- */
 static int   g_serve;                 /* 1 = jail stays alive, serves execs */
@@ -168,6 +193,8 @@ static int   g_lsm_on;
 
 static void lsm_register(void);       /* defined with the exec client code */
 static void lsm_unregister(void);
+static int  net_veth_register(pid_t child);
+static void net_veth_unregister(pid_t child);
 
 static void write_info(pid_t jail)
 {
@@ -442,12 +469,48 @@ static void do_mounts(void)
     NR("/run");     mmkdir(p, 0755);   tmpfs_mount(p, "size=64m,mode=755");
     /* with host networking, systemd-resolved lives behind /run/systemd —
      * bind it ro so /etc/resolv.conf's symlink and the resolver socket work */
-    if (!C.net_none) {
+    if (C.netmode == NET_HOST) {
         NR("/run/systemd"); mmkdir(p, 0755);
         /* note: no ro-remount — the mount is owned by the init userns and
          * EPERMs; but real DAC applies (agent uid == our uid on host)    */
         if (mount("/run/systemd", p, NULL, MS_BIND | MS_REC, NULL) < 0)
             warn2("bind /run/systemd (DNS may fail)");
+    }
+
+    /* veth: /etc/resolv.conf usually points at the host's LOOPBACK stub
+     * resolver (127.0.0.53) — unreachable from our netns.  Put
+     * systemd-resolved's UPSTREAM list where resolv.conf points
+     * (following the symlink: it dangles inside the jail otherwise). */
+    if (C.netmode == NET_VETH) {
+        struct stat st;
+        const char *up = "/run/systemd/resolve/resolv.conf";
+        if (stat(up, &st) == 0) {
+            char tgt[PATH_MAX];
+            ssize_t n = readlink("/etc/resolv.conf", tgt, sizeof tgt - 1);
+            if (n > 0) {
+                tgt[n] = 0;
+                if (tgt[0] != '/') {
+                    char rel[PATH_MAX];
+                    snprintf(rel, sizeof rel, "%s", tgt);
+                    snprintf(tgt, sizeof tgt, "/etc/%s", rel);
+                }
+                normalize_path(tgt);
+            } else {
+                snprintf(tgt, sizeof tgt, "/etc/resolv.conf");
+            }
+            char dst[PATH_MAX];
+            snprintf(dst, sizeof dst, "%s%s", g_newroot, tgt);
+            char *slash = strrchr(dst, '/');
+            *slash = 0; mmkdir_p(dst, 0755); *slash = '/';
+            int fd = open(dst, O_CREAT | O_RDONLY, 0644);
+            if (fd >= 0) close(fd);
+            /* no ro-remount: like the --net host /run/systemd bind, this
+             * EPERMs (the source sb is owned by init_userns).  DAC still
+             * applies — the file is root-owned 0644 and the agent's uid
+             * is our unprivileged uid on the host, so it stays read-only
+             * in practice. */
+            bind_mount(up, dst, 0, 0);
+        }
     }
 
     /* fresh /proc for our PID namespace (the child is PID 1 of it) */
@@ -918,6 +981,47 @@ static void net_lo_up(void)
     close(s);
 }
 
+/* --net veth: configure the interface the agentlsm daemon pushed into
+ * our netns (we own the netns, so plain ioctls suffice — no iproute2,
+ * no netlink library).  Parameters arrived via the sync pipe. */
+static void net_veth_up(void)
+{
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) { warn2("veth socket"); return; }
+
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof ifr);
+    snprintf(ifr.ifr_name, sizeof ifr.ifr_name, "%s", C.veth_if);
+    struct sockaddr_in *sin = (struct sockaddr_in *)&ifr.ifr_addr;
+    sin->sin_family = AF_INET;
+
+    if (inet_pton(AF_INET, C.veth_ip, &sin->sin_addr) != 1 ||
+        ioctl(s, SIOCSIFADDR, &ifr) < 0)
+        { warn2("veth addr"); goto out; }
+    inet_pton(AF_INET, "255.255.255.252", &sin->sin_addr);   /* /30 */
+    if (ioctl(s, SIOCSIFNETMASK, &ifr) < 0) { warn2("veth netmask"); goto out; }
+    if (ioctl(s, SIOCGIFFLAGS, &ifr) == 0) {
+        ifr.ifr_flags |= IFF_UP;
+        if (ioctl(s, SIOCSIFFLAGS, &ifr) < 0) { warn2("veth up"); goto out; }
+    }
+
+    /* default route via the host end of the pair */
+    struct rtentry rt;
+    memset(&rt, 0, sizeof rt);
+    struct sockaddr_in *dst = (struct sockaddr_in *)&rt.rt_dst;
+    struct sockaddr_in *gw  = (struct sockaddr_in *)&rt.rt_gateway;
+    struct sockaddr_in *msk = (struct sockaddr_in *)&rt.rt_genmask;
+    dst->sin_family = AF_INET;
+    msk->sin_family = AF_INET;
+    gw->sin_family  = AF_INET;
+    if (inet_pton(AF_INET, C.veth_gw, &gw->sin_addr) != 1) { warn2("veth gw"); goto out; }
+    rt.rt_flags = RTF_UP | RTF_GATEWAY;
+    rt.rt_dev   = C.veth_if;
+    if (ioctl(s, SIOCADDRT, &rt) < 0) warn2("veth default route");
+out:
+    close(s);
+}
+
 /* ------------------------------------------------------------------ */
 /* long-running mode: the jail stays alive, commands stream in over a  */
 /* unix socket. Connection fds are passed across the namespace with   */
@@ -1127,6 +1231,7 @@ static void serve_loop(pid_t jail)
     kill(jail, SIGKILL);
     waitpid(jail, NULL, 0);
     lsm_unregister();
+    net_veth_unregister(jail);
     unlink(g_sock_path);
     unlink(g_info_path);
     fprintf(stderr, "sand: jail stopped\n");
@@ -1305,6 +1410,33 @@ static void lsm_unregister(void)
     g_lsm_on = 0;
     char cmd[64];
     snprintf(cmd, sizeof cmd, "CLR %llu", (unsigned long long)g_lsm_cgid);
+    lsm_cmd(cmd, NULL, 0);
+}
+
+/* --net veth: the daemon (root) builds the pair + NAT; we configure
+ * our end ourselves once it lands in the cell's netns.  The reply
+ * rides the sync pipe: plain "x" means fallback to no network. */
+static int net_veth_register(pid_t child)
+{
+    char cmd[64], rep[128];
+    snprintf(cmd, sizeof cmd, "NETUP %d", (int)child);
+    if (lsm_cmd(cmd, rep, sizeof rep) < 0 || strncmp(rep, "OK ", 3) ||
+        sscanf(rep + 3, "%63s %63s %63s",
+               C.veth_if, C.veth_ip, C.veth_gw) != 3) {
+        fprintf(stderr, "sand: --net veth needs the agentlsm daemon "
+                        "(sudo agentlsm serve) — falling back to --net none\n");
+        return -1;
+    }
+    g_veth_on = 1;
+    return 0;
+}
+
+static void net_veth_unregister(pid_t child)
+{
+    if (!g_veth_on) return;
+    g_veth_on = 0;
+    char cmd[64];
+    snprintf(cmd, sizeof cmd, "NETDOWN %d", (int)child);
     lsm_cmd(cmd, NULL, 0);
 }
 
@@ -1522,9 +1654,17 @@ static int child_main(void *arg)
     if (g_ask_sp[0] >= 0) close(g_ask_sp[0]);   /* supervisor's end */
 
     /* wait until parent wrote our uid_map / gid_map AND parked us in the
-     * sandbox cgroup (must happen while we still share its cgroup view)  */
-    char b;
-    if (read(g_sync[0], &b, 1) != 1) _exit(126);
+     * sandbox cgroup (must happen while we still share its cgroup view).
+     * The sync byte doubles as the veth config channel: "x" alone means
+     * no veth (or fallback); "x <if> <ip> <gw>" means configure it. */
+    char buf[160];
+    ssize_t rn = read(g_sync[0], buf, sizeof(buf) - 1);
+    if (rn < 1) _exit(126);
+    buf[rn] = 0;
+    int have_veth = 0;
+    if (C.netmode == NET_VETH)
+        have_veth = sscanf(buf + 1, "%63s %63s %63s",
+                           C.veth_if, C.veth_ip, C.veth_gw) == 3;
 
     /* now adopt a private cgroup view rooted at the sandbox cgroup */
     if (unshare(CLONE_NEWCGROUP) < 0) warn2("cgroup namespace");
@@ -1550,7 +1690,10 @@ static int child_main(void *arg)
             close(nfd);
         }
     }
-    if (C.net_none)     net_lo_up();
+    if (C.netmode != NET_HOST) {
+        net_lo_up();
+        if (have_veth) net_veth_up();
+    }
 
     if (chdir("/home/agent") < 0) warn2("chdir workdir");
 
@@ -1626,7 +1769,8 @@ static void usage(FILE *out)
 "  --mem SIZE    memory.max  (512M, 2G, bytes; default 2G)\n"
 "  --cpu N       cpu.max quota in cores (0.5, 2; default 2)\n"
 "  --pids N      pids.max    (default 256)\n"
-"  --net MODE    none | host (default none — loopback only, no routes)\n"
+"  --net MODE    none | host | veth (default none — loopback only;\n"
+"                veth = real networking with NAT, needs agentlsm daemon)\n"
 "  --workdir DIR writable workspace (default ~/agent-work)\n"
 "  --ro DIR      extra read-only bind (repeatable, lands in /mnt/NAME)\n"
 "  --rw DIR      extra read-write bind (repeatable, lands in /mnt/NAME)\n"
@@ -1717,7 +1861,8 @@ int main(int argc, char **argv)
         }
         case 'P': C.pids = atoi(optarg); break;
         case 'n':
-            if (!strcmp(optarg, "host")) C.net_none = 0;
+            if (!strcmp(optarg, "host")) C.netmode = NET_HOST;
+            else if (!strcmp(optarg, "veth")) C.netmode = NET_VETH;
             else if (strcmp(optarg, "none")) { usage(stderr); return 2; }
             break;
         case 'w':
@@ -1808,7 +1953,7 @@ int main(int argc, char **argv)
 
     const int ns = CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC |
                    CLONE_NEWUTS |
-                   (C.net_none ? CLONE_NEWNET : 0);
+                   (C.netmode != NET_HOST ? CLONE_NEWNET : 0);
 
     const size_t SZ = 1 << 20;
     char *stack = malloc(SZ);
@@ -1836,7 +1981,17 @@ int main(int argc, char **argv)
     if (C.secure && g_have_cg)
         lsm_register();
 
-    if (write(g_sync[1], "x", 1) < 0) warn2("sync child");
+    /* --net veth: the daemon moves one end of a fresh pair into the
+     * child's netns (created by clone, child still waits on the pipe);
+     * config travels to the child in the sync message itself */
+    if (C.netmode == NET_VETH)
+        net_veth_register(pid);
+
+    char syncmsg[160] = "x";
+    if (g_veth_on)
+        snprintf(syncmsg, sizeof syncmsg, "x %s %s %s",
+                 C.veth_if, C.veth_ip, C.veth_gw);
+    if (write(g_sync[1], syncmsg, strlen(syncmsg)) < 0) warn2("sync child");
 
     /* the child installs the filter after its mounts, then hands us the
      * notify listener; parked syscalls queue in-kernel, so no race */
@@ -1885,6 +2040,7 @@ int main(int argc, char **argv)
 
     if (g_have_cg) rmdir(g_cgpath);
     lsm_unregister();
+    net_veth_unregister(pid);
     rmdir(g_newroot);
 
     if (WIFEXITED(status))
