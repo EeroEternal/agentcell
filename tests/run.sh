@@ -132,7 +132,7 @@ section "io.max"
 SELF=$(sed -n 's|^0::||p' /proc/self/cgroup)
 BASE=$(echo "$SELF" | sed 's|\(/user@[0-9]*\.service\).*|\1|')
 CTRL="/sys/fs/cgroup$BASE/cgroup.controllers"
-if [ -r "$CTRL" ] && grep -qw io "$CTRL"; then
+if [ -r "$CTRL" ] && grep -qw io "$CTRL" && [ -w "/sys/fs/cgroup$BASE" ]; then
     t0=$(date +%s%N)
     ./sand --io-wbps 8M -- dd if=/dev/zero of=/home/agent/.iotest \
           bs=1M count=32 oflag=direct >>"$LOG" 2>&1
@@ -147,7 +147,7 @@ if [ -r "$CTRL" ] && grep -qw io "$CTRL"; then
     fi
     : > "$LOG"
 else
-    skip "io.max throttles workdir writes" "io controller not delegated"
+    skip "io.max throttles workdir writes" "io controller not delegated (README has the one-liner)"
 fi
 
 section "serve mode + exec protocol"
