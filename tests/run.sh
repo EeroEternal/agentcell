@@ -166,6 +166,29 @@ t_out "exec echo"      "hello"   ./sand exec "$SOCK" -- /bin/echo hello
 t_out "exec stdin"     "piped"   sh -c "printf piped | ./sand exec $SOCK -- cat"
 t_rc  "exec rc 0 propagates"  0 ./sand exec "$SOCK" -- /bin/true
 t_rc  "exec rc 7 propagates"  7 ./sand exec "$SOCK" -- sh -c 'exit 7'
+
+# streaming stdin: with the old batch protocol (read-all-then-exec) this
+# deadlocks — "first:" can only appear while the producer still holds
+# the pipe open.  (stdbuf -o0: sh full-buffers socket stdout otherwise.
+# Note the client holds back the reply's last 4 bytes — they're the exit
+# status trailer — so we match "first:", not the full line)
+mkfifo "$RT/stin"
+./sand exec "$SOCK" -- stdbuf -o0 sh -c 'read a; echo "first:$a"; read b; echo "second:$b"' \
+    < "$RT/stin" > "$RT/stout" 2>&1 &
+EXPID=$!
+exec {FD}>"$RT/stin"
+printf 'one\n' >&$FD
+sleep 0.5
+if grep -q "first:" "$RT/stout" && ! grep -q "second" "$RT/stout"; then
+    pass "exec streams stdin live"
+else
+    fail "exec streams stdin live"
+fi
+printf 'two\n' >&$FD
+exec {FD}>&-
+wait "$EXPID"
+grep -q "second:two" "$RT/stout" && pass "exec stream completes" \
+                                 || fail "exec stream completes"
 kill "$CELL_PID" 2>/dev/null; wait "$CELL_PID" 2>/dev/null
 wait_gone "$SOCK" && pass "socket cleaned on stop" || fail "socket cleaned on stop"
 CELL_PID=""

@@ -1077,9 +1077,13 @@ out:
 /* long-running mode: the jail stays alive, commands stream in over a  */
 /* unix socket. Connection fds are passed across the namespace with   */
 /* SCM_RIGHTS, so data flows client <-> jailed command directly.      */
-/* wire format (little endian):                                        */
-/*   request:  u32 argc { u32 len, bytes }*argc  u32 stdin_len bytes   */
-/*   response: raw stdout/stderr, then u32 exit status, then EOF      */
+/* wire format (little endian):
+ *   request:  u32 argc { u32 len, bytes }*argc — then the socket turns
+ *             full-duplex: whatever the client writes becomes the
+ *             command's stdin, LIVE (SHUT_WR signals EOF)
+ *   response: the command's stdout+stderr bytes, then u32 exit status,
+ *             then EOF
+ */
 /* ------------------------------------------------------------------ */
 
 static void put_u32(char *b, uint32_t v)
@@ -1115,7 +1119,10 @@ static int write_full(int fd, const void *buf, size_t n)
     return 0;
 }
 
-/* the jail side: run one command with its stdio on the client socket */
+/* the jail side: run one command with its stdio on the client socket.
+ * stdin is pumped live: socket bytes go into a pipe, the client's
+ * SHUT_WR becomes the child's EOF.  stdout/stderr flow back directly
+ * (dup2 onto the socket). */
 static void handle_conn(int conn)
 {
     enum { MAXARGS = 256 };
@@ -1135,37 +1142,50 @@ static void handle_conn(int conn)
         argv[i][len] = 0;
     }
 
-    /* optional stdin blob -> memfd (allowed: memfd_create isn't denied) */
-    uint32_t slen;
-    int in_fd = open("/dev/null", O_RDONLY);
-    if (!read_full(conn, &slen, 4) && slen) {
-        in_fd = syscall(SYS_memfd_create, "stdin", 0);
-        char buf[65536];
-        while (slen) {
-            size_t chunk = slen > sizeof buf ? sizeof buf : slen;
-            if (read_full(conn, buf, chunk)) break;
-            if (write_full(in_fd, buf, chunk)) break;
-            slen -= chunk;
-        }
-        lseek(in_fd, 0, SEEK_SET);
-    }
+    int inpipe[2] = { -1, -1 };
+    if (pipe(inpipe) < 0) goto out;
 
     pid_t p = fork();
     if (p == 0) {
-        dup2(in_fd, 0);
+        dup2(inpipe[0], 0);
         dup2(conn, 1);
         dup2(conn, 2);
         for (int fd = 3; fd < 64; fd++) close(fd);
         execvp(argv[0], argv);
         _exit(127);
     }
-    close(in_fd);
+    close(inpipe[0]);
 
-    int st = 0;
+    /* pump conn -> pipe until stdin EOF or child exit.  A child that
+     * never reads stdin just gets its input discarded — backpressure,
+     * never deadlock. */
+    int st = 0, stdin_eof = 0;
+    for (;;) {
+        if (waitpid(p, &st, WNOHANG) == p) break;
+        if (stdin_eof) {            /* nothing left to pump; just wait */
+            struct timespec ts = { 0, 100 * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+            continue;
+        }
+        struct pollfd pf = { .fd = conn, .events = POLLIN };
+        if (poll(&pf, 1, 100) < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (!(pf.revents & POLLIN)) continue;
+        char buf[65536];
+        ssize_t r = read(conn, buf, sizeof buf);
+        if (r <= 0) {                          /* client half-closed */
+            stdin_eof = 1;
+            close(inpipe[1]); inpipe[1] = -1;  /* child sees EOF */
+        } else if (inpipe[1] >= 0 && write_full(inpipe[1], buf, r) < 0) {
+            close(inpipe[1]); inpipe[1] = -1;  /* child stopped reading */
+        }
+    }
+    if (inpipe[1] >= 0) close(inpipe[1]);
     waitpid(p, &st, 0);
     uint32_t code = WIFEXITED(st) ? (uint32_t)WEXITSTATUS(st)
                   : WIFSIGNALED(st) ? 128u + (uint32_t)WTERMSIG(st) : 1;
-    write_full(conn, &(uint32_t){0}, 0);   /* no-op keeps gcc quiet */
     put_u32((char *)&code, code);
     write_full(conn, &code, 4);
 
@@ -1311,7 +1331,7 @@ static int client_exec(char **av)
         return 2;
     }
 
-    /* build request: argc + args + stdin blob */
+    /* build request header: argc + args (stdin streams live afterwards) */
     size_t cap = 1 << 16, len = 0;
     char *req = malloc(cap);
     if (!req) return 2;
@@ -1336,47 +1356,55 @@ static int client_exec(char **av)
         APPEND(*p, strlen(*p));
     }
 
-    /* stdin: pipe it in whole (up to 64M); tty stdin is skipped */
-    size_t in_len = 0;
-    char *in_buf = NULL;
-    if (!isatty(0)) {
-        size_t icap = 1 << 16;
-        in_buf = malloc(icap);
-        for (;;) {
-            if (in_len == icap) {
-                icap <<= 1;
-                in_buf = realloc(in_buf, icap);
-                if (!in_buf) return 2;
-            }
-            ssize_t r = read(0, in_buf + in_len, icap - in_len);
-            if (r <= 0 || in_len > (64u << 20)) break;
-            in_len += r;
-        }
-    }
-    put_u32(b4, in_len);
-    APPEND(b4, 4);
-    if (in_len) APPEND(in_buf, in_len);
-
     if (write_full(s, req, len)) { fprintf(stderr, "sand: send failed\n"); return 2; }
-    shutdown(s, SHUT_WR);
+    free(req);
 
-    /* stream the reply; last 4 bytes are the exit status */
-    cap = 1 << 16; len = 0;
-    char *rep = malloc(cap);
+    /* full-duplex phase: our stdin -> socket (live; a tty works too),
+     * socket -> stdout, LIVE.  The reply's final 4 bytes are the exit
+     * status, so printing always holds back a 4-byte tail until EOF.
+     * SIGPIPE off: a command that exits early must not kill us. */
+    signal(SIGPIPE, SIG_IGN);
+    unsigned char pend[4];
+    int npend = 0;
+    int wr_open = 1;
     for (;;) {
-        if (len == cap) {
-            cap <<= 1;
-            rep = realloc(rep, cap);
-            if (!rep) return 2;
+        struct pollfd pf[2] = {
+            { .fd = s, .events = POLLIN },                    /* reply   */
+            { .fd = 0, .events = wr_open ? POLLIN : 0 },      /* stdin   */
+        };
+        if (poll(pf, 2, -1) < 0) {
+            if (errno == EINTR) continue;
+            break;
         }
-        ssize_t r = read(s, rep + len, cap - len);
-        if (r <= 0) break;
-        len += r;
+        if (pf[0].revents & (POLLIN | POLLHUP | POLLERR)) {
+            char buf[65536];
+            ssize_t r = read(s, buf, sizeof buf);
+            if (r <= 0) break;              /* EOF: reply complete */
+            /* emit everything except the trailing 4 bytes */
+            size_t total = (size_t)npend + (size_t)r;
+            size_t emit = total > 4 ? total - 4 : 0;
+            size_t from_pend = emit < (size_t)npend ? emit : (size_t)npend;
+            if (from_pend) fwrite(pend, 1, from_pend, stdout);
+            if (emit > from_pend)
+                fwrite(buf, 1, emit - from_pend, stdout);
+            fflush(stdout);
+            unsigned char np[4] = {0};
+            for (size_t i = emit, j = 0; i < total && j < 4; i++, j++)
+                np[j] = i < (size_t)npend ? pend[i] : (unsigned char)buf[i - npend];
+            memcpy(pend, np, 4);
+            npend = (int)(total - emit);
+        }
+        if (wr_open && (pf[1].revents & (POLLIN | POLLHUP | POLLERR))) {
+            char buf[65536];
+            ssize_t r = read(0, buf, sizeof buf);
+            if (r <= 0 || write_full(s, buf, r) < 0) {
+                shutdown(s, SHUT_WR);       /* stdin EOF -> jail */
+                wr_open = 0;
+            }
+        }
     }
-    if (len < 4) { fprintf(stderr, "sand: protocol error\n"); return 2; }
-    fwrite(rep, 1, len - 4, stdout);
-    fflush(stdout);
-    return (int)get_u32(rep + len - 4);
+    if (npend != 4) { fprintf(stderr, "sand: protocol error\n"); return 2; }
+    return (int)get_u32((char *)pend);
 }
 
 /* ------------------------------------------------------------------ */
