@@ -1,6 +1,6 @@
 # AgentCell
 
-**A ~1000-line AI-agent sandbox built directly on Linux kernel primitives.**
+**An AI-agent sandbox built directly on Linux kernel primitives.**
 No Docker, no container runtime, no daemon — and it runs **fully unprivileged**.
 
 ```
