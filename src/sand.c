@@ -42,6 +42,7 @@
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -161,6 +162,8 @@ struct cfg {
     int  secure;                    /* register with agentlsm daemon */
     char deny[MAXBIND][256];        /* extra LSM deny prefixes */
     int  n_deny;
+    char *ov[MAXBIND]; int n_ov;      /* --overlay DIR: copy-on-write binds */
+    long io_rbps, io_wbps;          /* io.max on the workspace device (0=off) */
     int  timeout;
     char *const *argv;
 };
@@ -369,6 +372,8 @@ static void cgroup_setup(void)
     /* arm controllers for our children; EPERM is fine if not delegated */
     snprintf(p, sizeof p, "%s/cgroup.subtree_control", base);
     write_file(p, "+cpu +memory +pids");
+    if (C.io_rbps || C.io_wbps)
+        write_file(p, "+io");   /* separate: often not delegated */
 
     snprintf(g_cgpath, sizeof g_cgpath, "%s/agentcell-%d", base, (int)getpid());
     if (mkdir(g_cgpath, 0755) < 0) {
@@ -381,6 +386,24 @@ static void cgroup_setup(void)
     snprintf(p, sizeof p, "%s/memory.max", g_cgpath);  write_file(p, v);
     snprintf(v, sizeof v, "%d", C.pids);
     snprintf(p, sizeof p, "%s/pids.max", g_cgpath);    write_file(p, v);
+
+    /* io.max throttles real block I/O on the workspace device; the
+     * in-sandbox tmpfs scratch (/tmp) has no backing device and is
+     * never throttled — only what actually hits the disk */
+    if (C.io_rbps || C.io_wbps) {
+        struct stat st;
+        if (!stat(C.workdir, &st)) {
+            size_t off = snprintf(v, sizeof v, "%u:%u",
+                                  major(st.st_dev), minor(st.st_dev));
+            if (C.io_rbps)
+                off += snprintf(v + off, sizeof v - off,
+                                " rbps=%ld", C.io_rbps);
+            if (C.io_wbps)
+                snprintf(v + off, sizeof v - off, " wbps=%ld", C.io_wbps);
+            snprintf(p, sizeof p, "%s/io.max", g_cgpath);
+            write_file(p, v);
+        }
+    }
     g_have_cg = 1;
 }
 
@@ -465,6 +488,28 @@ static void do_mounts(void)
 
     /* scratch space: tmpfs = RAM speed (2.1 GB/s vs 509 MB/s SSD here) */
     NR("/tmp");     mmkdir(p, 01777);  tmpfs_mount(p, "size=1g,mode=1777");
+
+    /* --overlay DIR: copy-on-write view of a host dir.  The lower is the
+     * host path (a filesystem root can't be a lower, but any subdir
+     * can); upper+work live on the scratch tmpfs and die with the
+     * sandbox — the host dir is never modified.  Writes still pass DAC
+     * as our unprivileged uid, so this shines for dirs WE own
+     * (~/src/myrepo): the agent edits freely, nothing persists. */
+    for (int i = 0; i < C.n_ov; i++) {
+        char dst[PATH_MAX], up[PATH_MAX], wk[PATH_MAX], opts[PATH_MAX * 3];
+        const char *base = basename_of(C.ov[i]);
+        snprintf(dst, sizeof dst, "%s/mnt/%s", g_newroot, base);
+        mmkdir_p(dst, 0755);
+        snprintf(up, sizeof up, "%s/tmp/.ovl/%d.up", g_newroot, i);
+        snprintf(wk, sizeof wk, "%s/tmp/.ovl/%d.wk", g_newroot, i);
+        mmkdir_p(up, 0700);
+        mmkdir_p(wk, 0700);
+        snprintf(opts, sizeof opts, "lowerdir=%s,upperdir=%s,workdir=%s",
+                 C.ov[i], up, wk);
+        if (mount("overlay", dst, "overlay", 0, opts) < 0)
+            die("overlay mount (userns overlayfs needs kernel >= 5.11)");
+    }
+
     NR("/var/tmp"); mmkdir_p(p, 01777); tmpfs_mount(p, "size=128m,mode=1777");
     NR("/run");     mmkdir(p, 0755);   tmpfs_mount(p, "size=64m,mode=755");
     /* with host networking, systemd-resolved lives behind /run/systemd —
@@ -638,6 +683,12 @@ static void landlock_apply(void)
     for (int i = 0; i < C.n_rw; i++) {
         char p[PATH_MAX];
         snprintf(p, sizeof p, "/mnt/%s", basename_of(C.rw[i]));
+        ll_allow(fd, p, rw);
+    }
+    /* overlay binds: rw — writes land in the disposable upper */
+    for (int i = 0; i < C.n_ov; i++) {
+        char p[PATH_MAX];
+        snprintf(p, sizeof p, "/mnt/%s", basename_of(C.ov[i]));
         ll_allow(fd, p, rw);
     }
 
@@ -1774,6 +1825,8 @@ static void usage(FILE *out)
 "  --workdir DIR writable workspace (default ~/agent-work)\n"
 "  --ro DIR      extra read-only bind (repeatable, lands in /mnt/NAME)\n"
 "  --rw DIR      extra read-write bind (repeatable, lands in /mnt/NAME)\n"
+"  --overlay DIR copy-on-write view of DIR at /mnt/NAME: reads see the\n"
+"                host, writes land in a throwaway tmpfs (repeatable)\n"
 "  --bind S:D    mount host path S at path D inside the sandbox (rw)\n"
 "  --bind-ro S:D same, but read-only\n"
 "  --timeout S   kill payload after S seconds\n"
@@ -1782,7 +1835,10 @@ static void usage(FILE *out)
 "  --deny PREFIX extra LSM deny prefix (repeatable, implies --secure;\n"
 "                paths as seen INSIDE the sandbox, e.g. /mnt/NAME)\n"
 "  --no-landlock | --no-seccomp   debug switches\n"
+"  --io-rbps SIZE  io.max read bytes/s on the workspace device\n"
+"  --io-wbps SIZE  io.max write bytes/s (e.g. 8M; throttles disk writes)\n"
 "  --ask         park denied syscalls and ask the supervisor on /dev/tty\n"
+"                (y=allow once, n=deny, a=always, k=kill; one-shot only)\n"
 "                (y=allow once, n=deny, a=always, k=kill; one-shot only)\n"
 "\n"
 "long-running mode (isolation set up once, then reused):\n"
@@ -1835,9 +1891,13 @@ int main(int argc, char **argv)
         {"workdir",     required_argument, 0, 'w'},
         {"ro",          required_argument, 0, 'r'},
         {"rw",          required_argument, 0, 'W'},
+        {"overlay",     required_argument, 0, 'O'},
         {"bind",        required_argument, 0, 'b'},
         {"bind-ro",     required_argument, 0, 'B'},
         {"timeout",     required_argument, 0, 't'},
+        {"overlay",     required_argument, 0, 'O'},
+        {"io-rbps",     required_argument, 0, 1000},
+        {"io-wbps",     required_argument, 0, 1001},
         {"ask",         no_argument, &C.ask, 1},
         {"secure",      no_argument, &C.secure, 1},
         {"deny",        required_argument, 0, 'd'},
@@ -1870,6 +1930,7 @@ int main(int argc, char **argv)
             break;
         case 'r': if (C.n_ro < MAXBIND) C.ro[C.n_ro++] = optarg; break;
         case 'W': if (C.n_rw < MAXBIND) C.rw[C.n_rw++] = optarg; break;
+        case 'O': if (C.n_ov < MAXBIND) C.ov[C.n_ov++] = optarg; break;
         case 'b': case 'B': {
             if (C.n_binds >= MAXBIND) break;
             char *colon = strchr(optarg, ':');
@@ -1888,6 +1949,8 @@ int main(int argc, char **argv)
             break;
         }
         case 't': C.timeout = atoi(optarg); break;
+        case 1000: C.io_rbps = parse_mem(optarg); break;
+        case 1001: C.io_wbps = parse_mem(optarg); break;
         case 'd':
             if (C.n_deny < MAXBIND) {
                 snprintf(C.deny[C.n_deny], 256, "%s", optarg);
@@ -1930,6 +1993,11 @@ int main(int argc, char **argv)
         char *r = realpath(C.rw[i], NULL);
         if (!r) die(C.rw[i]);
         C.rw[i] = r;
+    }
+    for (int i = 0; i < C.n_ov; i++) {
+        char *r = realpath(C.ov[i], NULL);
+        if (!r) die(C.ov[i]);
+        C.ov[i] = r;
     }
 
     if (!mkdtemp(g_newroot)) die("mkdtemp");

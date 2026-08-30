@@ -112,6 +112,44 @@ else
     : > "$LOG"
 fi
 
+section "overlay binds"
+OVLMARK="ovl-src-$$"
+echo "sentinel-$OVLMARK" > "$HOME/.agentcell-ovl-src"
+t_out "overlay: host file readable" "sentinel-$OVLMARK" \
+      ./sand --overlay "$HOME" -- cat "/mnt/$(basename "$HOME")/.agentcell-ovl-src"
+t_out "overlay: write works in-cell" "ovl-write" \
+      ./sand --overlay "$HOME" -- sh -c \
+      "echo ovl-write > /mnt/$(basename "$HOME")/.agentcell-ovl-t && cat /mnt/$(basename "$HOME")/.agentcell-ovl-t"
+if [ -e "$HOME/.agentcell-ovl-t" ]; then
+    rm -f "$HOME/.agentcell-ovl-t"
+    fail "overlay: nothing persists"
+else
+    pass "overlay: nothing persists"
+fi
+rm -f "$HOME/.agentcell-ovl-src"
+
+section "io.max"
+SELF=$(sed -n 's|^0::||p' /proc/self/cgroup)
+BASE=$(echo "$SELF" | sed 's|\(/user@[0-9]*\.service\).*|\1|')
+CTRL="/sys/fs/cgroup$BASE/cgroup.controllers"
+if [ -r "$CTRL" ] && grep -qw io "$CTRL"; then
+    t0=$(date +%s%N)
+    ./sand --io-wbps 8M -- dd if=/dev/zero of=/home/agent/.iotest \
+          bs=1M count=32 oflag=direct >>"$LOG" 2>&1
+    rc=$?
+    el=$(( ($(date +%s%N) - t0) / 1000000000 ))
+    rm -f "$HOME/agent-work/.iotest"
+    # 32M at 8M/s must take >= 3s; unthrottled it's < 1s
+    if [ $rc = 0 ] && [ "$el" -ge 3 ]; then
+        pass "io.max throttles workdir writes"
+    else
+        fail "io.max throttles workdir writes (rc=$rc ${el}s)"
+    fi
+    : > "$LOG"
+else
+    skip "io.max throttles workdir writes" "io controller not delegated"
+fi
+
 section "serve mode + exec protocol"
 ./sand serve --timeout 60 >"$RT/serve.out" 2>&1 &
 CELL_PID=$!

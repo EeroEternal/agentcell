@@ -14,7 +14,7 @@ No Docker, no container runtime, no daemon — and it runs **fully unprivileged*
 │                    fresh /proc /dev /sys; rw tmpfs /tmp /run    │
 │  2. namespaces    user+pid+net+ipc+uts+cgroup via clone(2)      │
 │                    uid 0 inside == your uid outside             │
-│  1. cgroup v2     cpu.max / memory.max / pids.max               │
+│  1. cgroup v2     cpu.max / memory.max / pids.max / io.max      │
 ├─────────────────────────────────────────────────────────────────┤
 │  eBPF monitor    tracepoint probes filtered by cgroup id +      │
 │  (agentmon)      kernel-audit tail — every exec, open, connect  │
@@ -38,7 +38,7 @@ audit trail the agent cannot see or disable.
 | network namespace (default) | `clone(CLONE_NEWNET)` | network access entirely (loopback only) |
 | Landlock | `landlock(2)` rulesets | writes/exec outside allowlisted paths |
 | seccomp-BPF | `seccomp(2)` + raw `sock_filter` | kernel attack surface (module ops, bpf, ptrace, new mount API, io_uring, keyring, …) |
-| cgroup v2 | `cpu.max`/`memory.max`/`pids.max` | resource exhaustion, fork bombs |
+| cgroup v2 | `cpu.max`/`memory.max`/`pids.max`/`io.max` | resource exhaustion, fork bombs, disk flooding |
 | eBPF tracepoints + audit | `bpf()` with cgroup-id filter | invisibility — every exec/open/connect is audited |
 
 ## Build
@@ -103,6 +103,40 @@ netns, so the cell gets systemd-resolved's upstream list instead.
 Notes: needs `iproute2` + `iptables` on the host; the cell can reach
 the host at the gateway IP (same model as a Docker bridge); without
 the daemon, `--net veth` warns and falls back to `--net none`.
+
+## Disposable views (`--overlay`) and disk limits (`--io-*`)
+
+```bash
+# copy-on-write view of a directory: the agent reads the real content
+# and can "modify" anything its DAC permissions allow — but every
+# write lands in a throwaway tmpfs layer; the host dir is never touched
+./sand --overlay ~/Dev/myrepo -- risky-agent     # jail sees /mnt/myrepo
+
+# throttle real disk I/O on the workspace device (cgroup v2 io.max)
+./sand --io-wbps 8M -- dd if=/dev/zero of=/home/agent/blob bs=1M count=32
+```
+
+`--overlay` (repeatable) uses userns overlayfs (kernel >= 5.11):
+lower = the host dir, upper/work on the scratch tmpfs.  There is no
+whole-root variant on purpose: a filesystem root can be neither bound
+nor used as a lowerdir from inside a user namespace (measured: EINVAL
+and ENOENT respectively), and DAC would still gate root-owned files —
+scoped overlays are the honest version.  They shine for dirs you own:
+let the agent edit your repo freely, watch `git status` stay clean.
+
+`--io-rbps`/`--io-wbps` write `io.max` for the block device backing
+the workdir (the /tmp tmpfs scratch has no backing device and is never
+throttled — only what actually hits the disk).  Needs the `io`
+controller delegated to your user slice; most distros delegate only
+cpu/memory/pids.  Enable it live (reverts on reboot):
+
+```bash
+for f in /sys/fs/cgroup/cgroup.subtree_control \
+         /sys/fs/cgroup/user.slice/cgroup.subtree_control \
+         /sys/fs/cgroup/user.slice/user-$UID.slice/cgroup.subtree_control; do
+    echo +io | sudo tee "$f"
+done
+```
 
 ## Long-running mode (cell server)
 
@@ -300,11 +334,9 @@ and a 1G tmpfs scratch.
 
 ## Ideas to extend
 
-- **BPF LSM hooks** (needs `bpf` in the LSM list): enforce policy
-  in-kernel on `file_open` / `bprm_check_security` instead of auditing.
-- **long-lived cell**: keep one sandbox alive, stream commands over a
-  unix socket, amortize all setup cost to zero.
-- `io.max` for disk rate limiting; overlayfs upperdir for disposable roots.
+- `--ask` in serve mode (approval flow for long-lived cells)
+- per-cell egress policy: netfilter rules on the `vethh*` host ends
+- idmapped binds, if the unprivileged idmap story ever settles
 
 ## License
 
