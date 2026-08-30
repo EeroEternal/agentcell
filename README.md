@@ -103,6 +103,34 @@ PID/net namespaces — applies to each exec'd command. Ctrl-C (or SIGTERM)
 cleans up the socket and kills the jail; the socket lives in
 `$XDG_RUNTIME_DIR` with mode 0600.
 
+## Ask mode (human-in-the-loop)
+
+`--ask` turns the seccomp deny-list into a question instead of an
+EPERM. When the agent calls a blocked syscall (`mount`, `ptrace`,
+`bpf`, `unshare`, ...), the syscall parks in the kernel and the
+supervisor asks you on `/dev/tty` (the payload's stdio is untouched):
+
+```
+[sand-ask] pid 7 requests unshare(0x20000000, 0, 0, ...)
+[sand-ask] y=allow once  n=deny (EPERM)  a=always  k=kill payload >
+```
+
+- `y` — the kernel executes this one call, still inside the jail's
+  namespaces (a tmpfs mount is contained; the other layers still
+  apply — e.g. Landlock independently refuses `move_mount`)
+- `n` — EPERM, the classic behavior
+- `a` — always allow this syscall number for the rest of the run
+- `k` — kill the payload
+
+Note that one logical operation can prompt several times: util-linux
+`mount` walks the whole new mount API (`fsopen` → `fsconfig` ×2 →
+`fsmount` → `move_mount`), one prompt per syscall.
+
+One-shot mode only (not `sand serve`); needs kernel >= 5.0. The
+clone-flag mask (`CLONE_NEWUSER`/`CLONE_NEWNET`) stays hard-denied —
+approval is by syscall number, not by argument.  Without a
+controlling terminal, prompts fall back to deny.
+
 ## eBPF audit monitor (root)
 
 ```bash
@@ -227,8 +255,6 @@ and a 1G tmpfs scratch.
 
 ## Ideas to extend
 
-- **seccomp user-notify** (`SECCOMP_FILTER_FLAG_USER_LISTENER`): a
-  supervisor approves syscalls per-call — "ask permission" flows.
 - **BPF LSM hooks** (needs `bpf` in the LSM list): enforce policy
   in-kernel on `file_open` / `bprm_check_security` instead of auditing.
 - **veth + NAT** for real (non-host-shared) network access.

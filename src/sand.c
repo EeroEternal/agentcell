@@ -10,6 +10,8 @@
  *   4. Landlock LSM: path-based allowlist (what may be read / written / exec'd)
  *   5. Seccomp-BPF: hand-built sock_filter deny-list (module loads, ptrace,
  *      bpf, new mount API, io_uring, keyring, time-setting, ...)
+ *      --ask turns the deny-list into SECCOMP_RET_USER_NOTIF: blocked
+ *      syscalls park in-kernel and the supervisor approves them on /dev/tty
  *
  * Runs 100% unprivileged — user namespaces give the child "root" that maps
  * to your normal uid outside, so a breakout gains nothing.
@@ -131,6 +133,7 @@ struct cfg {
          binds[MAXBIND]; int n_binds;
     int  no_landlock;
     int  no_seccomp;
+    int  ask;                       /* user-notify: ask before denied syscalls */
     int  secure;                    /* register with agentlsm daemon */
     char deny[MAXBIND][256];        /* extra LSM deny prefixes */
     int  n_deny;
@@ -568,6 +571,36 @@ static void landlock_apply(void)
 #define DENY_EPERM (SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA))
 #define DENY_KILL  (SECCOMP_RET_KILL_PROCESS)
 
+/* --ask: park blocked syscalls and ask the supervisor instead of EPERM
+ * (seccomp user notification, kernel >= 5.0).  Fallbacks for old headers. */
+#ifndef SECCOMP_RET_USER_NOTIF
+#define SECCOMP_RET_USER_NOTIF 0x7fc00000U
+struct seccomp_notif {
+    __u64 id;
+    __u32 pid;
+    __u32 flags;
+    struct seccomp_data data;
+};
+struct seccomp_notif_resp {
+    __u64 id;
+    __s64 val;
+    __s32 error;
+    __u32 flags;
+};
+#define SECCOMP_IOC_MAGIC '!'
+#define SECCOMP_IOR(nr, type)  _IOR(SECCOMP_IOC_MAGIC, nr, type)
+#define SECCOMP_IOWR(nr, type) _IOWR(SECCOMP_IOC_MAGIC, nr, type)
+#define SECCOMP_IOCTL_NOTIF_RECV     SECCOMP_IOWR(0, struct seccomp_notif)
+#define SECCOMP_IOCTL_NOTIF_SEND     SECCOMP_IOWR(1, struct seccomp_notif_resp)
+#define SECCOMP_IOCTL_NOTIF_ID_VALID SECCOMP_IOR(2, __u64)
+#endif
+#ifndef SECCOMP_FILTER_FLAG_NEW_LISTENER
+#define SECCOMP_FILTER_FLAG_NEW_LISTENER (1UL << 3)
+#endif
+#ifndef SECCOMP_USER_NOTIF_FLAG_CONTINUE
+#define SECCOMP_USER_NOTIF_FLAG_CONTINUE (1UL << 0)
+#endif
+
 /* seccomp_data layout: nr @0 (int), arch @4 (u32), ip @8, args[0] @16 */
 #define OFF_NR   0
 #define OFF_ARCH 4
@@ -578,18 +611,27 @@ static int g_n;
 
 static void f_push(struct sock_filter f) { g_flt[g_n++] = f; }
 
-/* deny-list collected here, compiled to a balanced binary-search tree */
-static long g_deny[128];
+/* deny-list collected here (nr + display name), compiled to a balanced
+ * binary-search tree; what a match gets: EPERM, or a supervisor
+ * question under --ask */
+struct sc_deny { long nr; const char *name; };
+static struct sc_deny g_deny[128];
 static int  g_ndeny;
+static __u32 g_deny_ret = DENY_EPERM;
 
-static void deny(long nr)
+static void deny(long nr, const char *name)
 {
-    g_deny[g_ndeny++] = nr;
+    g_deny[g_ndeny].nr = nr;
+    g_deny[g_ndeny++].name = name;
 }
+#define DENY(sym) deny(SYS_##sym, #sym)
 
-static int cmp_long(const void *a, const void *b)
+static void denylist_build(void);
+
+static int cmp_sc(const void *a, const void *b)
 {
-    long x = *(const long *)a, y = *(const long *)b;
+    long x = ((const struct sc_deny *)a)->nr;
+    long y = ((const struct sc_deny *)b)->nr;
     return x < y ? -1 : x > y;
 }
 
@@ -613,10 +655,10 @@ static void emit_bst(int lo, int hi)
     int node = g_n;
 
     f_push((struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JGT | BPF_K,
-                                        g_deny[mid], 0, 0)); /* jt patched */
+                                        g_deny[mid].nr, 0, 0)); /* patched */
     f_push((struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
-                                        g_deny[mid], 0, 1));
-    f_push((struct sock_filter)BPF_STMT(BPF_RET | BPF_K, DENY_EPERM));
+                                        g_deny[mid].nr, 0, 1));
+    f_push((struct sock_filter)BPF_STMT(BPF_RET | BPF_K, g_deny_ret));
 
     emit_bst(lo, mid - 1);                    /* values < mid */
 
@@ -635,8 +677,11 @@ static void deny_enosys(long nr)
             SECCOMP_RET_ERRNO | (ENOSYS & SECCOMP_RET_DATA)));
 }
 
-static void seccomp_apply(void)
+static int seccomp_apply(void)
 {
+    if (C.ask)
+        g_deny_ret = SECCOMP_RET_USER_NOTIF;
+
     /* [0] load arch
      * [1] if arch == AUDIT_ARCH_X86_64 jump over kill
      * [2] kill process (wrong arch → never make it to a syscall)
@@ -662,54 +707,12 @@ static void seccomp_apply(void)
     f_push((struct sock_filter)BPF_STMT(BPF_RET | BPF_K, DENY_EPERM));
     f_push((struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_NR));
 
-    /* kernel / modules / debugging */
-    deny(SYS_bpf);                deny(SYS_perf_event_open);
-    deny(SYS_init_module);        deny(SYS_finit_module);
-    deny(SYS_delete_module);      deny(SYS_kexec_load);
-    deny(SYS_kexec_file_load);    deny(SYS_reboot);
-    deny(SYS_swapon);             deny(SYS_swapoff);
-#ifdef SYS_acpi
-    deny(SYS_acpi);
-#endif
-    /* inspecting / injecting into other processes */
-    deny(SYS_ptrace);             deny(SYS_process_vm_readv);
-    deny(SYS_process_vm_writev);  deny(SYS_kcmp);
-    deny(SYS_pidfd_getfd);        deny(SYS_process_madvise);
-#ifdef SYS_process_mrelease
-    deny(SYS_process_mrelease);
-#endif
-    /* namespace / mount escapes */
-    deny(SYS_mount);              deny(SYS_umount2);
-    deny(SYS_pivot_root);         deny(SYS_unshare);
-    deny(SYS_setns);              deny(SYS_open_by_handle_at);
-    deny(SYS_name_to_handle_at);
-    deny(SYS_fsopen);             deny(SYS_fsconfig);
-    deny(SYS_fsmount);            deny(SYS_fspick);
-    deny(SYS_move_mount);         deny(SYS_open_tree);
-    deny(SYS_mount_setattr);
+    denylist_build();
     /* clone3: ENOSYS so libc falls back to clone(2), which is masked */
     deny_enosys(SYS_clone3);
-    /* keyring, time, io_uring and other sharp edges */
-    deny(SYS_keyctl);             deny(SYS_add_key);
-    deny(SYS_request_key);        deny(SYS_fanotify_init);
-    deny(SYS_clock_settime);
-#ifdef SYS_clock_settime64
-    deny(SYS_clock_settime64);
-#endif
-    deny(SYS_settimeofday);       deny(SYS_adjtimex);
-    deny(SYS_vhangup);            deny(SYS_syslog);
-    deny(SYS_ioperm);             deny(SYS_iopl);
-    deny(SYS_quotactl);           deny(SYS_quotactl_fd);
-    deny(SYS_userfaultfd);        deny(SYS_uselib);
-    deny(SYS_lookup_dcookie);
-    deny(SYS_io_uring_setup);     deny(SYS_io_uring_enter);
-    deny(SYS_io_uring_register);
-#ifdef SYS_vm86
-    deny(SYS_vm86);               deny(SYS_vm86old);
-#endif
 
     /* deny-list -> sorted balanced BST: O(log n) per syscall */
-    qsort(g_deny, g_ndeny, sizeof g_deny[0], cmp_long);
+    qsort(g_deny, g_ndeny, sizeof g_deny[0], cmp_sc);
     emit_bst(0, g_ndeny - 1);
 
     /* everything else is allowed */
@@ -718,9 +721,159 @@ static void seccomp_apply(void)
     struct sock_fprog prog = { .len = (unsigned short)g_n, .filter = g_flt };
 
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) die("no_new_privs");
-    if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER,
-                SECCOMP_FILTER_FLAG_LOG, &prog) < 0)
-        die("seccomp install");
+    unsigned long fl = SECCOMP_FILTER_FLAG_LOG;
+    if (C.ask) fl |= SECCOMP_FILTER_FLAG_NEW_LISTENER;
+    int rc = (int)syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, fl, &prog);
+    if (rc < 0) die("seccomp install (--ask needs kernel >= 5.0)");
+    return rc;   /* 0 normally; the notify listener fd under --ask */
+}
+
+/* the deny-list: built in the child by seccomp_apply() (compiled into
+ * the filter) and in the parent under --ask (for sc_name display) */
+static void denylist_build(void)
+{
+    /* kernel / modules / debugging */
+    DENY(bpf);                DENY(perf_event_open);
+    DENY(init_module);        DENY(finit_module);
+    DENY(delete_module);      DENY(kexec_load);
+    DENY(kexec_file_load);    DENY(reboot);
+    DENY(swapon);             DENY(swapoff);
+#ifdef SYS_acpi
+    DENY(acpi);
+#endif
+    /* inspecting / injecting into other processes */
+    DENY(ptrace);             DENY(process_vm_readv);
+    DENY(process_vm_writev);  DENY(kcmp);
+    DENY(pidfd_getfd);        DENY(process_madvise);
+#ifdef SYS_process_mrelease
+    DENY(process_mrelease);
+#endif
+    /* namespace / mount escapes */
+    DENY(mount);              DENY(umount2);
+    DENY(pivot_root);         DENY(unshare);
+    DENY(setns);              DENY(open_by_handle_at);
+    DENY(name_to_handle_at);
+    DENY(fsopen);             DENY(fsconfig);
+    DENY(fsmount);            DENY(fspick);
+    DENY(move_mount);         DENY(open_tree);
+    DENY(mount_setattr);
+    /* keyring, time, io_uring and other sharp edges */
+    DENY(keyctl);             DENY(add_key);
+    DENY(request_key);        DENY(fanotify_init);
+    DENY(clock_settime);
+#ifdef SYS_clock_settime64
+    DENY(clock_settime64);
+#endif
+    DENY(settimeofday);       DENY(adjtimex);
+    DENY(vhangup);            DENY(syslog);
+    DENY(ioperm);             DENY(iopl);
+    DENY(quotactl);           DENY(quotactl_fd);
+    DENY(userfaultfd);        DENY(uselib);
+    DENY(lookup_dcookie);
+    DENY(io_uring_setup);     DENY(io_uring_enter);
+    DENY(io_uring_register);
+#ifdef SYS_vm86
+    DENY(vm86);               DENY(vm86old);
+#endif
+}
+
+/* ------------------------------------------------------------------ */
+/* --ask: human-in-the-loop approval for blocked syscalls              */
+/*                                                                     */
+/* With --ask the deny-list returns SECCOMP_RET_USER_NOTIF instead of  */
+/* EPERM: the syscall parks in-kernel and the supervisor (the parent)  */
+/* decides per call — y = run it, n = EPERM, a = always allow this nr, */
+/* k = kill the payload.  The question goes to /dev/tty so the         */
+/* payload's stdio stays untouched.                                    */
+/* ------------------------------------------------------------------ */
+
+static int   g_ask_sp[2] = { -1, -1 };  /* fd-pass channel: child -> sup */
+static int   g_ask_fd = -1;             /* notify listener (supervisor)  */
+static __u64 g_always[8];               /* "always allow" bitmap (nr<512) */
+
+static const char *sc_name(long nr)
+{
+    for (int i = 0; i < g_ndeny; i++)
+        if (g_deny[i].nr == nr) return g_deny[i].name;
+    return "?";
+}
+
+/* mirror of send_fd() (defined with the serve code): receive one fd */
+static int recv_fd(int sock)
+{
+    char b;
+    char cbuf[CMSG_SPACE(sizeof(int))];
+    struct iovec iov = { .iov_base = &b, .iov_len = 1 };
+    struct msghdr msg = {0};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf;
+    msg.msg_controllen = sizeof cbuf;
+    if (recvmsg(sock, &msg, 0) <= 0) return -1;
+    struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+    if (!c || c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS)
+        return -1;
+    return *(int *)CMSG_DATA(c);
+}
+
+/* one parked syscall: show it, ask, answer.  The payload's thread
+ * stays blocked in the kernel until the response (or its death). */
+static void ask_handle(int fd, pid_t payload)
+{
+    struct seccomp_notif req = {0};
+    struct seccomp_notif_resp resp = {0};
+
+    if (ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV, &req) < 0)
+        return;                            /* filter gone (child exited) */
+    resp.id = req.id;
+
+    long nr = req.data.nr;
+    if (nr >= 0 && nr < 512 && (g_always[nr >> 6] & (1ULL << (nr & 63)))) {
+        resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+        goto answer;
+    }
+
+    FILE *tt = fopen("/dev/tty", "r+");
+    if (!tt) {                             /* no terminal: cannot ask */
+        resp.error = -EPERM;
+        goto answer;
+    }
+    fprintf(tt, "\n[sand-ask] pid %u requests %s(%#llx, %#llx, %#llx, ...)\n"
+                "[sand-ask] y=allow once  n=deny (EPERM)  a=always  "
+                "k=kill payload > ",
+            req.pid, sc_name(nr),
+            (unsigned long long)req.data.args[0],
+            (unsigned long long)req.data.args[1],
+            (unsigned long long)req.data.args[2]);
+    fflush(tt);
+    int c = fgetc(tt), d;
+    while (c != '\n' && c != EOF && (d = fgetc(tt)) != '\n' && d != EOF)
+        ;                                   /* drain rest of the line */
+    fclose(tt);
+
+    switch (c) {
+    case 'y': case 'Y':
+        resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+        break;
+    case 'a': case 'A':
+        if (nr >= 0 && nr < 512)
+            g_always[nr >> 6] |= 1ULL << (nr & 63);
+        resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+        break;
+    case 'k': case 'K':
+        kill(payload, SIGKILL);
+        resp.error = -EPERM;
+        break;
+    default:
+        resp.error = -EPERM;
+        break;
+    }
+
+answer:
+    /* the syscalling thread may have died while we asked (--timeout or
+     * a 'k' answer); only respond if the notification is still valid */
+    if (ioctl(fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &req.id) == 0)
+        ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND, &resp);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1333,6 +1486,8 @@ static int child_main(void *arg)
     /* die with the supervisor */
     prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
 
+    if (g_ask_sp[0] >= 0) close(g_ask_sp[0]);   /* supervisor's end */
+
     /* wait until parent wrote our uid_map / gid_map AND parked us in the
      * sandbox cgroup (must happen while we still share its cgroup view)  */
     char b;
@@ -1355,7 +1510,13 @@ static int child_main(void *arg)
         warn2("remount / ro");
 
     if (!C.no_landlock) landlock_apply();
-    if (!C.no_seccomp)  seccomp_apply();
+    if (!C.no_seccomp) {
+        int nfd = seccomp_apply();
+        if (C.ask) {           /* hand the notify listener to the parent */
+            send_fd(g_ask_sp[1], nfd);
+            close(nfd);
+        }
+    }
     if (C.net_none)     net_lo_up();
 
     if (chdir("/home/agent") < 0) warn2("chdir workdir");
@@ -1444,6 +1605,8 @@ static void usage(FILE *out)
 "  --deny PREFIX extra LSM deny prefix (repeatable, implies --secure;\n"
 "                paths as seen INSIDE the sandbox, e.g. /mnt/NAME)\n"
 "  --no-landlock | --no-seccomp   debug switches\n"
+"  --ask         park denied syscalls and ask the supervisor on /dev/tty\n"
+"                (y=allow once, n=deny, a=always, k=kill; one-shot only)\n"
 "\n"
 "long-running mode (isolation set up once, then reused):\n"
 "  sand serve [options]       start a jailed exec server, prints SOCK\n"
@@ -1497,6 +1660,7 @@ int main(int argc, char **argv)
         {"bind",        required_argument, 0, 'b'},
         {"bind-ro",     required_argument, 0, 'B'},
         {"timeout",     required_argument, 0, 't'},
+        {"ask",         no_argument, &C.ask, 1},
         {"secure",      no_argument, &C.secure, 1},
         {"deny",        required_argument, 0, 'd'},
         {"no-landlock", no_argument, &C.no_landlock, 1},
@@ -1557,6 +1721,16 @@ int main(int argc, char **argv)
         default: usage(stderr); return 2;
         }
     }
+    if (g_serve && C.ask) {
+        fprintf(stderr, "sand: --ask is one-shot only "
+                        "(serve mode unsupported)\n");
+        return 2;
+    }
+    if (C.ask && C.no_seccomp) {
+        fprintf(stderr, "sand: --ask needs the seccomp filter; "
+                        "ignoring --ask\n");
+        C.ask = 0;
+    }
     if (optind < argc) C.argv = (char *const *)&argv[optind];
 
     /* default workspace */
@@ -1593,6 +1767,11 @@ int main(int argc, char **argv)
         g_jail_sock = sp[1];
     }
 
+    /* --ask: the child passes its seccomp notify listener through here */
+    if (C.ask && socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0,
+                            g_ask_sp) < 0)
+        die("socketpair");
+
     const int ns = CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC |
                    CLONE_NEWUTS |
                    (C.net_none ? CLONE_NEWNET : 0);
@@ -1605,6 +1784,7 @@ int main(int argc, char **argv)
     if (pid < 0) die("clone (userns disabled? sysctl kernel.unprivileged_userns_clone)");
 
     close(g_sync[0]);
+    if (g_ask_sp[1] >= 0) close(g_ask_sp[1]);    /* child's end */
 
     /* give the child its identity: uid 0 inside == uid 1000 outside */
     write_uid_maps(pid);
@@ -1624,6 +1804,15 @@ int main(int argc, char **argv)
 
     if (write(g_sync[1], "x", 1) < 0) warn2("sync child");
 
+    /* the child installs the filter after its mounts, then hands us the
+     * notify listener; parked syscalls queue in-kernel, so no race */
+    if (C.ask) {
+        denylist_build();       /* sc_name() in the prompt needs it */
+        g_ask_fd = recv_fd(g_ask_sp[0]);
+        if (g_ask_fd < 0) warn2("recv notify listener (--ask inactive)");
+        close(g_ask_sp[0]);
+    }
+
     if (g_serve)
         serve_loop(pid);         /* reaps the jail, cleans socket+cgroup */
 
@@ -1632,7 +1821,24 @@ int main(int argc, char **argv)
     signal(SIGTERM, SIG_IGN);
 
     int status = 0;
-    if (C.timeout > 0) {
+    if (g_ask_fd >= 0) {
+        /* --ask: delegated syscalls park until we answer; poll the
+         * listener while the payload lives (200ms tick for --timeout) */
+        time_t t0 = time(NULL);
+        for (;;) {
+            struct pollfd pf = { .fd = g_ask_fd, .events = POLLIN };
+            if (poll(&pf, 1, 200) > 0 && (pf.revents & POLLIN))
+                ask_handle(g_ask_fd, pid);
+            if (waitpid(pid, &status, WNOHANG) == pid)
+                break;
+            if (C.timeout > 0 && time(NULL) - t0 >= C.timeout) {
+                kill(pid, SIGKILL);
+                waitpid(pid, &status, 0);
+                break;
+            }
+        }
+        close(g_ask_fd);
+    } else if (C.timeout > 0) {
         int left = C.timeout;
         while (waitpid(pid, &status, WNOHANG) == 0) {
             if (left-- <= 0) { kill(pid, SIGKILL); break; }

@@ -87,6 +87,29 @@ else
     pass "timeout kills payload"
 fi
 
+section "ask mode (seccomp user-notify)"
+if ! command -v script >/dev/null 2>&1; then
+    skip "ask tests" "script(1) not found"
+elif ! ./sand --ask -- /bin/true >>"$LOG" 2>&1; then
+    skip "ask tests" "kernel lacks user-notify (needs >= 5.0)"
+else
+    pass "ask listener installs"
+    # script(1) gives the payload a pty, so /dev/tty prompting works;
+    # the piped answers arrive on that tty
+    t_out "ask: deny answer -> EPERM" "Operation not permitted" \
+        sh -c "printf 'n\n' | script -q -e -c './sand --ask -- unshare -p true' /dev/null || true"
+    t_out "ask: allow once -> runs" "exited 0" \
+        sh -c "printf 'y\n' | script -q -e -c './sand --ask -- unshare -u true' /dev/null"
+    if sh -c "printf 'a\n' | script -q -e -c './sand --ask -- sh -c \"unshare -p true && unshare -p true && echo BOTH-OK\"' /dev/null" >>"$LOG" 2>&1 \
+       && grep -q BOTH-OK "$LOG" \
+       && [ "$(grep -c requests "$LOG")" = 1 ]; then
+        pass "ask: always -> one prompt, two trips"
+    else
+        fail "ask: always -> one prompt, two trips"
+    fi
+    : > "$LOG"
+fi
+
 section "serve mode + exec protocol"
 ./sand serve --timeout 60 >"$RT/serve.out" 2>&1 &
 CELL_PID=$!
