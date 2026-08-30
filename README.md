@@ -186,6 +186,19 @@ Trust model: the control socket is 0666 — any local user can register
 policy for any cgroup id. Fine on a single-user workstation; needs peer
 credentials + an allowlist before multi-user use.
 
+## Testing
+
+```bash
+make check
+```
+
+Runs `tests/run.sh`: unprivileged launcher / serve / exec tests always
+run; the agentmon and agentlsm tiers run when sudo works and skip
+cleanly otherwise (agentlsm also needs `bpf` in
+`/sys/kernel/security/lsm`). The suite isolates itself in a mktemp
+runtime dir and leaves nothing behind. CI runs it on every push
+(Ubuntu runner: agentmon tier runs, agentlsm tier skips).
+
 ## Measured performance
 
 On an old i5-4210U (2C/4T), Arch kernel 7.1.9:

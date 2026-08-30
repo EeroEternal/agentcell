@@ -19,13 +19,22 @@ jobs:
       - name: build
         run: make
 
-      - name: cli smoke test
-        run: |
-          ./sand --help
-          ./agentmon 2>&1 | head -1 || true
+      # ubuntu >= 23.10 restricts unprivileged user namespaces via
+      # AppArmor; the sandbox needs CLONE_NEWUSER.  No-op on runners
+      # where the knob doesn't exist.
+      - name: allow unprivileged user namespaces
+        run: sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0 || true
 
-      # namespace smoke test: may fail inside the containerized runner
-      # (docker seccomp blocks CLONE_NEWUSER); passes on real systems
-      - name: sandbox smoke test
-        continue-on-error: true
-        run: ./sand -- /bin/true
+      # the full regression suite (tests/run.sh).  Passwordless sudo on
+      # the runner unlocks the privileged tiers: agentmon probes run;
+      # the agentlsm tier skips unless the runner kernel has "bpf" in
+      # /sys/kernel/security/lsm (Ubuntu's default LSM list doesn't).
+      - name: make check
+        run: make check 2>&1 | tee check.log
+
+      - name: upload check log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-log
+          path: check.log
