@@ -363,6 +363,29 @@ static void cgroup_setup(void)
 
 #define NR(path) snprintf(p, sizeof p, "%s%s", g_newroot, path)
 
+/* mirror a host top-level path (/bin, /lib64, ...) into the jail root:
+ * symlink -> recreate with the same target (relative targets keep
+ * working because /usr is bound), real dir -> read-only bind.
+ * Needed because distros disagree on usrmerge targets: Arch has
+ * /lib64 -> usr/lib, Ubuntu has /lib64 -> usr/lib64 — hardcoding
+ * either breaks the ELF interpreter path on the other. */
+static void mirror_top(const char *path)
+{
+    char p[PATH_MAX], tgt[PATH_MAX];
+    struct stat st;
+    NR(path);
+    if (lstat(path, &st) < 0) return;
+    if (S_ISLNK(st.st_mode)) {
+        ssize_t n = readlink(path, tgt, sizeof tgt - 1);
+        if (n <= 0) return;
+        tgt[n] = 0;
+        if (symlink(tgt, p) && errno != EEXIST) die(path);
+    } else {
+        mmkdir(p, 0755);
+        bind_mount(path, p, 1, 1);
+    }
+}
+
 static void do_mounts(void)
 {
     char p[PATH_MAX];
@@ -380,10 +403,11 @@ static void do_mounts(void)
     NR("/etc");    mmkdir(p, 0755); bind_mount("/etc", p, 1, 1);
     NR("/opt");    mmkdir(p, 0755); bind_mount("/opt", p, 1, 1);
 
-    NR("/bin");    if (symlink("usr/bin",  p) && errno != EEXIST) die("symlink /bin");
-    NR("/sbin");   if (symlink("usr/bin",  p) && errno != EEXIST) die("symlink /sbin");
-    NR("/lib");    if (symlink("usr/lib",  p) && errno != EEXIST) die("symlink /lib");
-    NR("/lib64");  if (symlink("usr/lib",  p) && errno != EEXIST) die("symlink /lib64");
+    /* /bin /sbin /lib /lib64: mirror the host layout exactly */
+    mirror_top("/bin");
+    mirror_top("/sbin");
+    mirror_top("/lib");
+    mirror_top("/lib64");
 
     /* the agent's writable workspace */
     NR("/home/agent"); mmkdir_p(p, 0755);
