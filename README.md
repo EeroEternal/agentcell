@@ -194,6 +194,10 @@ sudo ./agentlsm serve
                   #   cell-x.sock  DENY node[123] /etc/shadow
 ./sand lsm -f deny,trip   # only the high-signal classes
                   # (classes: deny,exec,open,net,trip; default all)
+                  # TRIP = seccomp-denied escape attempts, seen on
+                  # raw_syscalls/sys_exit — seccomp runs before the
+                  # entry tracepoints, but its -EPERM return value is
+                  # visible on the exit path
 
 # hot policy updates on RUNNING cells — works even on cells that
 # were started WITHOUT --secure; effective on the very next open:

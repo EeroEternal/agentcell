@@ -6,9 +6,11 @@
  * buffer. Every probe filters on the cgroup id of the sandbox, so only
  * the sandboxed agent's activity is reported — not the whole system.
  *
- * Notably these tracepoints fire BEFORE seccomp runs, so "escape
- * attempts" (mount, unshare, bpf, ptrace, ...) are visible here even
- * though the seccomp layer then denies them with EPERM.
+ * Note: the kernel runs seccomp BEFORE the sys_enter tracepoints, so
+ * the EV_ATTEMPT probes do NOT fire for syscalls the sandbox's seccomp
+ * filter denies — those are covered by --audit mode (kernel audit log,
+ * type=1326).  They still fire when watching cgroups without such a
+ * filter (e.g. ad-hoc monitoring of non-sandboxed workloads).
  *
  * Compile: clang -target bpf -O2 -g -c agentmon.bpf.c -o agentmon.bpf.o
  */

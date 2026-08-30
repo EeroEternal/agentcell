@@ -28,8 +28,10 @@
  *
  *     Denials are enforced (-EPERM) AND reported to watchers.  The
  *     daemon also carries agentmon's tracepoint probes (exec / open /
- *     connect / escape-attempt), filtered to registered cells — one
- *     watcher stream for everything.
+ *     connect) plus a raw_syscalls/sys_exit probe for TRIP events —
+ *     seccomp-denied syscalls never reach the entry tracepoints, but
+ *     their -EPERM return is visible on the exit path.  One watcher
+ *     stream for everything.
  *
  * Socket: /run/agentcell/lsm.sock (0666 — single-user trust model for
  * now: anyone local may register policy; document before sharing).

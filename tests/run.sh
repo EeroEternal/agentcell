@@ -198,12 +198,18 @@ if lsmok; then
     # unified stream: tracepoint events ride the same watcher
     ./sand exec "$SOCK" -- /bin/echo probe >>"$LOG" 2>&1
     ./sand exec "$SOCK" -- mount -t tmpfs none /tmp >>"$LOG" 2>&1
-    : > "$LOG"
     sleep 0.5
     grep -q "EXEC " "$RT/follow.log" && pass "exec event streamed" \
                                      || fail "exec event streamed"
-    grep -q "TRIP " "$RT/follow.log" && pass "trip event streamed" \
-                                     || fail "trip event streamed"
+    # TRIP comes from the kernel audit tail (journalctl): allow latency
+    trip_ok=0
+    for _ in $(seq 40); do
+        grep -q "TRIP " "$RT/follow.log" && { trip_ok=1; break; }
+        sleep 0.1
+    done
+    [ "$trip_ok" = 1 ] && pass "trip event streamed" \
+                       || fail "trip event streamed"
+    : > "$LOG"
 
     # class filter: watcher sees only what it asked for
     ./sand lsm -f deny >"$RT/follow2.log" 2>&1 &
