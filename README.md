@@ -306,6 +306,30 @@ cleanly otherwise (agentlsm also needs `bpf` in
 runtime dir and leaves nothing behind. CI runs it on every push
 (Ubuntu runner: agentmon tier runs, agentlsm tier skips).
 
+## Use as a backend service (web UI)
+
+AgentCell doubles as a sandbox backend: the gateway service runs
+**unprivileged** and drives cells over their unix sockets:
+
+```
+browser ⇄ your web app ⇄ gateway (no root!) ⇄ sand serve cells
+```
+
+`examples/webui/server.py` is a working single-file gateway (Python
+stdlib only) with a built-in console page:
+
+```bash
+python3 examples/webui/server.py 8080
+# open http://127.0.0.1:8080 — every command runs inside a fresh cell
+```
+
+API: `POST /api/cells` (create) → `POST /api/cells/<id>/exec`
+(command → stdout + exact exit code) → `DELETE` (full cleanup).
+Add `--secure` / `--net veth` to `SERVE_FLAGS` for kernel policy and
+NAT networking once `sudo agentlsm serve` runs.  The demo has no
+auth — put your own in front; one cell per user/session scales to
+hundreds of cells (~5 ms create, ~2 ms per command).
+
 ## Measured performance
 
 On an old i5-4210U (2C/4T), Arch kernel 7.1.9:
