@@ -323,7 +323,9 @@ and a 1G tmpfs scratch.
 
 ## Notes & limits
 
-- x86_64 only (syscall numbers hardcoded in the seccomp filter & probes).
+- x86_64 only — Intel and AMD alike (the syscall ABI is per-architecture,
+  not per-vendor; numbers are hardcoded in the seccomp filter & probes).
+  ARM64 would need its own syscall table + `AUDIT_ARCH_AARCH64`.
 - `/etc` is bound read-only and therefore readable (incl. `/etc/shadow` —
   host root can read it anyway; swap to a curated copy if that matters).
 - seccomp returns **EPERM** (agent-visible). Switch the deny tail to
