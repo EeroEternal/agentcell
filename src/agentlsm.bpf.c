@@ -62,15 +62,120 @@ struct {
     __type(value, __u32);
 } cellpol SEC(".maps");
 
+/* event classes streamed to watchers (sand lsm -f) */
+#define EV_DENY    1   /* LSM file_open denial         */
+#define EV_EXEC    2   /* execve(path)                 */
+#define EV_OPEN    3   /* openat(path)                 */
+#define EV_CONNECT 4   /* connect(sockaddr)            */
+#define EV_TRIP    5   /* blocked-syscall attempt (nr) */
+
 struct evt {
     __u64 cgid;
-    char path[PLEN];
+    __u32 tgid;
+    __u32 type;
+    __u32 nr;
+    char  comm[16];
+    char  path[192];
 };
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 16);
+    __uint(max_entries, 1 << 20);
 } events SEC(".maps");
+
+/* sys_enter tracepoint context — stable kernel ABI (matches the format
+ * files under /sys/kernel/tracing/events/syscalls/sys_enter_XXX) */
+struct tp_sys_enter {
+    unsigned short common_type;
+    unsigned char  common_flags;
+    unsigned char  common_preempt_count;
+    int            common_pid;
+    long           syscall_nr;
+    unsigned long  args[6];
+};
+
+/* activity probes (merged from agentmon): only registered cells, one
+ * hash lookup for the other ~10k processes — same short-circuit as
+ * the LSM hook.  These tracepoints fire BEFORE seccomp, so escape
+ * attempts (TRIP) are visible even though seccomp then denies them. */
+static __always_inline struct evt *mon_reserve(__u32 type, __u32 nr)
+{
+    __u64 cgid = bpf_get_current_cgroup_id();
+    if (!bpf_map_lookup_elem(&cells, &cgid))
+        return 0;
+    struct evt *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e)
+        return 0;
+    __u64 pt = bpf_get_current_pid_tgid();
+    e->cgid = cgid;
+    e->tgid = pt >> 32;
+    e->type = type;
+    e->nr   = nr;
+    bpf_get_current_comm(e->comm, sizeof(e->comm));
+    return e;
+}
+
+/* what did the agent exec? */
+SEC("tracepoint/syscalls/sys_enter_execve")
+int tp_execve(struct tp_sys_enter *ctx)
+{
+    struct evt *e = mon_reserve(EV_EXEC, 59);
+    if (!e) return 0;
+    bpf_probe_read_user_str(e->path, sizeof(e->path),
+                            (const void *)ctx->args[0]);
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+/* which files is the agent touching? (openat: args[1] = pathname) */
+SEC("tracepoint/syscalls/sys_enter_openat")
+int tp_openat(struct tp_sys_enter *ctx)
+{
+    struct evt *e = mon_reserve(EV_OPEN, 257);
+    if (!e) return 0;
+    bpf_probe_read_user_str(e->path, sizeof(e->path),
+                            (const void *)ctx->args[1]);
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+/* where is the agent connecting? (connect: args[1] = sockaddr*) */
+SEC("tracepoint/syscalls/sys_enter_connect")
+int tp_connect(struct tp_sys_enter *ctx)
+{
+    struct evt *e = mon_reserve(EV_CONNECT, 42);
+    if (!e) return 0;
+    bpf_probe_read_user(e->path, 16, (const void *)ctx->args[1]);
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+/* escape attempts — the sandbox denies these anyway (seccomp EPERM
+ * right after the tracepoint), but you want to KNOW about them */
+#define TRIP(name, nr)                                                     \
+SEC("tracepoint/syscalls/sys_enter_" #name)                                \
+int tp_trip_##name(struct tp_sys_enter *ctx)                               \
+{                                                                          \
+    struct evt *e = mon_reserve(EV_TRIP, (nr));                            \
+    if (!e) return 0;                                                      \
+    bpf_ringbuf_submit(e, 0);                                              \
+    return 0;                                                              \
+}
+
+TRIP(mount,            165)
+TRIP(umount,           166)   /* tracepoint keeps the historic name */
+TRIP(pivot_root,       155)
+TRIP(unshare,          272)
+TRIP(setns,            308)
+TRIP(clone3,           435)
+TRIP(bpf,              321)
+TRIP(perf_event_open,  298)
+TRIP(ptrace,           101)
+TRIP(keyctl,           250)
+TRIP(init_module,      175)
+TRIP(delete_module,    176)
+TRIP(userfaultfd,      323)
+TRIP(io_uring_setup,   425)
 
 /* set from userspace: 0 = audit only (log, allow) */
 const volatile __u64 target_cgid = 0;
@@ -137,8 +242,13 @@ int BPF_PROG(cell_file_open, struct file *file)
                     struct evt *e = bpf_ringbuf_reserve(&events,
                                                          sizeof(*e), 0);
                     if (e) {
+                        __u64 pt = bpf_get_current_pid_tgid();
                         e->cgid = cgid;
-                        __builtin_memcpy(e->path, path, sizeof(e->path));
+                        e->tgid = pt >> 32;
+                        e->type = EV_DENY;
+                        e->nr   = 0;
+                        bpf_get_current_comm(e->comm, sizeof(e->comm));
+                        __builtin_memcpy(e->path, path, PLEN);
                         bpf_ringbuf_submit(e, 0);
                     }
                     return -EPERM;
@@ -186,8 +296,13 @@ int BPF_PROG(cell_file_open, struct file *file)
             return -EPERM;      /* kernel-level denial */
         struct evt *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
         if (e) {
+            __u64 pt = bpf_get_current_pid_tgid();
             e->cgid = cgid;
-            __builtin_memcpy(e->path, path, sizeof(e->path));
+            e->tgid = pt >> 32;
+            e->type = EV_DENY;
+            e->nr   = 0;
+            bpf_get_current_comm(e->comm, sizeof(e->comm));
+            __builtin_memcpy(e->path, path, PLEN);
             bpf_ringbuf_submit(e, 0);
         }
     }

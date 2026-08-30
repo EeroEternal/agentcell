@@ -1446,6 +1446,8 @@ static int lsm_status(char **av)
                   !strcmp(av[0], "reset")))
         return lsm_ctl_cmd(av[0], av + 1);
     int follow = av[0] && (!strcmp(av[0], "-f") || !strcmp(av[0], "--follow"));
+    /* optional class filter: sand lsm -f deny,exec,open,net,trip */
+    const char *classes = follow && av[1] ? av[1] : NULL;
 
     struct cellname cells[MAXBIND];
     int ncells = build_cell_table(cells, MAXBIND);
@@ -1478,9 +1480,16 @@ static int lsm_status(char **av)
 listed:
     if (!follow) { close(s); return 0; }
 
-    /* WATCH: stream denial events, resolving cgid -> cell */
-    printf("-- following LSM denials (Ctrl-C to stop) --\n");
-    write_full(s, "WATCH\n", 6);
+    /* WATCH: stream cell events (deny + exec/open/net/trip),
+     * resolving cgid -> cell name */
+    printf("-- following cell events (Ctrl-C to stop) --\n");
+    if (classes) {
+        char w[300];
+        snprintf(w, sizeof w, "WATCH %s\n", classes);
+        write_full(s, w, strlen(w));
+    } else {
+        write_full(s, "WATCH\n", 6);
+    }
     for (;;) {
         ssize_t n = read(s, lrep, sizeof lrep - 1);
         if (n <= 0) break;
@@ -1489,9 +1498,9 @@ listed:
         while ((nl = strchr(p, '\n'))) {
             *nl = 0;
             unsigned long long cgid;
-            char path[256];
-            if (sscanf(p, "EV %llu %255s", &cgid, path) == 2)
-                printf("%s  DENY %s\n", cell_of(cells, ncells, cgid), path);
+            int off = 0;
+            if (sscanf(p, "EV %llu %n", &cgid, &off) == 1 && off)
+                printf("%s  %s\n", cell_of(cells, ncells, cgid), p + off);
             p = nl + 1;
         }
     }
@@ -1636,7 +1645,8 @@ static void usage(FILE *out)
 "  sand serve [options]       start a jailed exec server, prints SOCK\n"
 "  sand exec SOCK [--] CMD..  run CMD inside that jail\n"
 "  sand cells | sand top      list running cells / live view\n"
-"  sand lsm [-f]              LSM policies, live denials (needs agentlsm)\n"
+"  sand lsm [-f [classes]]    LSM policies; -f: live event stream from\n"
+"                            the daemon (deny,exec,open,net,trip; default all)\n"
 "  sand lsm deny CELL PREFIX..  hot-add deny rule to a RUNNING cell\n"
 "  sand lsm allow CELL PREFIX..  hot-remove; reset CELL: drop all rules\n");
 }

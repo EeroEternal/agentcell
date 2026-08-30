@@ -22,9 +22,14 @@
  *       DEL <cgid> <prefix>    drop one rule
  *       CLR <cgid>             cell died: drop all its rules
  *       LIST                   "cgid prefix" lines, then END
- *       WATCH                  from now on: "EV <cgid> <path>" lines
+ *       WATCH [classes]        from now on: "EV <cgid> <CLASS> <text>"
+ *                              lines; classes: deny,exec,open,net,trip
+ *                              (comma-separated, default all)
  *
- *     Denials are enforced (-EPERM) AND reported to watchers.
+ *     Denials are enforced (-EPERM) AND reported to watchers.  The
+ *     daemon also carries agentmon's tracepoint probes (exec / open /
+ *     connect / escape-attempt), filtered to registered cells — one
+ *     watcher stream for everything.
  *
  * Socket: /run/agentcell/lsm.sock (0666 — single-user trust model for
  * now: anyone local may register policy; document before sharing).
@@ -32,6 +37,7 @@
 #define _GNU_SOURCE
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
+#include <arpa/inet.h>
 #include <errno.h>
 #include <poll.h>
 #include <signal.h>
@@ -54,12 +60,55 @@
 static volatile sig_atomic_t g_stop;
 static void on_sig(int s) { (void)s; g_stop = 1; }
 
-struct evt { __u64 cgid; char path[PLEN]; };
+/* event classes — keep in sync with agentlsm.bpf.c */
+#define EV_DENY    1
+#define EV_EXEC    2
+#define EV_OPEN    3
+#define EV_CONNECT 4
+#define EV_TRIP    5
+
+struct evt {
+    __u64 cgid;
+    __u32 tgid;
+    __u32 type;
+    __u32 nr;
+    char  comm[16];
+    char  path[192];
+};
+
+static const char *attempt_name(unsigned nr)
+{
+    switch (nr) {
+    case 165: return "mount";
+    case 166: return "umount2";
+    case 155: return "pivot_root";
+    case 272: return "unshare";
+    case 308: return "setns";
+    case 435: return "clone3";
+    case 321: return "bpf";
+    case 298: return "perf_event_open";
+    case 101: return "ptrace";
+    case 250: return "keyctl";
+    case 175: return "init_module";
+    case 176: return "delete_module";
+    case 323: return "userfaultfd";
+    case 425: return "io_uring_setup";
+    case 430: return "fsopen";          /* new mount API */
+    case 431: return "fsconfig";
+    case 432: return "fsmount";
+    case 433: return "fspick";
+    case 429: return "move_mount";
+    case 428: return "open_tree";
+    case 442: return "mount_setattr";
+    case 202: return "ioperm";
+    case 110: return "iopl";
+    default:  return "?";
+    }
+}
 
 /* ---- shared bpf state ------------------------------------------------ */
 
 static struct bpf_object *g_obj;
-static struct bpf_link   *g_link;
 static int g_fd_policy, g_fd_cells, g_fd_cellpol, g_fd_events;
 
 static int bpf_load_attach(__u64 target_cgid, int enforce,
@@ -90,20 +139,19 @@ static int bpf_load_attach(__u64 target_cgid, int enforce,
         return -1;
     }
 
-    struct bpf_program *prog =
-        bpf_object__find_program_by_name(obj, "cell_file_open");
-    if (!prog) { fprintf(stderr, "agentlsm: program not found\n"); return -1; }
-
-    struct bpf_link *link = bpf_program__attach(prog);
-    if (!link) {
-        fprintf(stderr, "agentlsm: attach lsm/file_open failed: %s\n"
-                        "  (is 'bpf' in /sys/kernel/security/lsm?)\n",
-                strerror(errno));
-        return -1;
+    /* attach every program in the object: the lsm/file_open hook plus
+     * the tracepoint probes (exec/open/connect/escape-attempts) */
+    struct bpf_program *prog;
+    bpf_object__for_each_program(prog, obj) {
+        if (!bpf_program__attach(prog)) {
+            fprintf(stderr, "agentlsm: attach %s failed: %s\n"
+                            "  (is 'bpf' in /sys/kernel/security/lsm?)\n",
+                    bpf_program__name(prog), strerror(errno));
+            return -1;
+        }
     }
 
     g_obj        = obj;
-    g_link       = link;
     g_fd_policy  = bpf_object__find_map_fd_by_name(obj, "policy");
     g_fd_cells   = bpf_object__find_map_fd_by_name(obj, "cells");
     g_fd_cellpol = bpf_object__find_map_fd_by_name(obj, "cellpol");
@@ -116,9 +164,8 @@ static int bpf_load_attach(__u64 target_cgid, int enforce,
 
 static void bpf_detach(void)
 {
-    if (g_link) bpf_link__destroy(g_link);
-    if (g_obj)  bpf_object__close(g_obj);
-    g_link = NULL; g_obj = NULL;
+    if (g_obj) bpf_object__close(g_obj);   /* takes all links with it */
+    g_obj = NULL;
 }
 
 /* ---- serve mode ------------------------------------------------------- */
@@ -126,6 +173,7 @@ static void bpf_detach(void)
 struct conn {
     int   fd;
     int   watcher;
+    __u32 mask;                 /* event classes this watcher wants */
     char  buf[256];
     size_t len;
 };
@@ -136,15 +184,21 @@ static void conn_drop(int i)
     close(g_conn[i].fd);
     g_conn[i].fd = -1;
     g_conn[i].watcher = 0;
+    g_conn[i].mask = 0;
 }
 
-/* fan one formatted line out to all watchers (best effort) */
-static void fanout(const char *line)
+/* fan one formatted line out to all watchers (best effort); the
+ * daemon's own log gets the high-signal classes only — the full
+ * stream (OPEN especially) would flood it */
+static void fanout(const char *line, __u32 classbit)
 {
-    fputs(line, stdout);                    /* daemon log too */
-    fflush(stdout);
+    if (classbit & ((1 << EV_DENY) | (1 << EV_TRIP))) {
+        fputs(line, stdout);
+        fflush(stdout);
+    }
     for (int i = 0; i < MAX_WATCH; i++) {
         if (g_conn[i].fd < 0 || !g_conn[i].watcher) continue;
+        if (!(g_conn[i].mask & classbit)) continue;
         if (write(g_conn[i].fd, line, strlen(line)) < 0)
             conn_drop(i);                   /* watcher went away */
     }
@@ -154,10 +208,52 @@ static int on_evt(void *ctx, void *data, size_t size)
 {
     (void)ctx; (void)size;
     struct evt *e = data;
-    char line[PLEN + 48];
-    snprintf(line, sizeof line, "EV %llu %s\n",
-             (unsigned long long)e->cgid, e->path);
-    fanout(line);
+    char info[300], line[400];
+    const char *cls;
+    __u32 bit;
+
+    switch (e->type) {
+    case EV_DENY:
+        cls = "DENY"; bit = 1 << EV_DENY;
+        snprintf(info, sizeof info, "%s[%u] %s", e->comm, e->tgid, e->path);
+        break;
+    case EV_EXEC:
+        cls = "EXEC"; bit = 1 << EV_EXEC;
+        snprintf(info, sizeof info, "%s[%u] %s", e->comm, e->tgid, e->path);
+        break;
+    case EV_OPEN:
+        cls = "OPEN"; bit = 1 << EV_OPEN;
+        snprintf(info, sizeof info, "%s[%u] %s", e->comm, e->tgid, e->path);
+        break;
+    case EV_CONNECT: {
+        cls = "NET"; bit = 1 << EV_CONNECT;
+        unsigned short fam;                      /* e->path = sockaddr */
+        memcpy(&fam, e->path, 2);
+        if (fam == 2 /* AF_INET */) {
+            unsigned short port;
+            unsigned char ip[4];
+            memcpy(&port, e->path + 2, 2);
+            memcpy(ip, e->path + 4, 4);
+            snprintf(info, sizeof info, "%s[%u] connect %u.%u.%u.%u:%u",
+                     e->comm, e->tgid, ip[0], ip[1], ip[2], ip[3],
+                     ntohs(port));
+        } else {
+            snprintf(info, sizeof info, "%s[%u] connect family=%u",
+                     e->comm, e->tgid, fam);
+        }
+        break;
+    }
+    case EV_TRIP:
+        cls = "TRIP"; bit = 1 << EV_TRIP;
+        snprintf(info, sizeof info, "%s[%u] blocked syscall %s (%u)",
+                 e->comm, e->tgid, attempt_name(e->nr), e->nr);
+        break;
+    default:
+        return 0;
+    }
+    snprintf(line, sizeof line, "EV %llu %s %s\n",
+             (unsigned long long)e->cgid, cls, info);
+    fanout(line, bit);
     return 0;
 }
 
@@ -233,8 +329,21 @@ static void serve_line(int ci, char *line)
             cur = nxt;
         }
         snprintf(rep, sizeof rep, "END\n");
-    } else if (!strcmp(line, "WATCH")) {
+    } else if (!strncmp(line, "WATCH", 5)) {
+        /* WATCH [deny,exec,open,net,trip] — bare WATCH = all classes */
+        __u32 mask = 0;
+        char *p = line + 5;
+        while (*p == ' ') p++;
+        for (char *tok = strtok(p, ","); tok; tok = strtok(NULL, ",")) {
+            if (!strcmp(tok, "deny"))  mask |= 1 << EV_DENY;
+            if (!strcmp(tok, "exec"))  mask |= 1 << EV_EXEC;
+            if (!strcmp(tok, "open"))  mask |= 1 << EV_OPEN;
+            if (!strcmp(tok, "net") || !strcmp(tok, "connect"))
+                mask |= 1 << EV_CONNECT;
+            if (!strcmp(tok, "trip"))  mask |= 1 << EV_TRIP;
+        }
         g_conn[ci].watcher = 1;
+        g_conn[ci].mask = mask ? mask : ~0u;
         snprintf(rep, sizeof rep, "OK\n");
     } else if (!strcmp(line, "QUIT") || !strcmp(line, "BYE")) {
         conn_drop(ci);
@@ -296,6 +405,7 @@ static int serve_mode(void)
                 else {
                     g_conn[slot].fd = c;
                     g_conn[slot].watcher = 0;
+                    g_conn[slot].mask = 0;
                     g_conn[slot].len = 0;
                 }
             }

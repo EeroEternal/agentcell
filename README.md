@@ -133,6 +133,11 @@ controlling terminal, prompts fall back to deny.
 
 ## eBPF audit monitor (root)
 
+> Registered cells are already covered by the **agentlsm daemon's
+> unified stream** (`sand lsm -f`) — same probes, no extra process.
+> `agentmon` remains for ad-hoc use: watching a cgroup that isn't
+> registered with the daemon, and `--audit` (the kernel-audit tail).
+
 ```bash
 # terminal 1: start a sandbox — note the cgroup it prints
 ./sand -- claude
@@ -178,9 +183,17 @@ sudo ./agentlsm serve
 ./sand --secure -- claude
 ./sand --deny /mnt/secrets -- claude
 
-# terminal 3: policies + live denials, no root needed
+# terminal 3: policies + live events, no root needed
 ./sand lsm        # table of armed policies, resolved to cell names
-./sand lsm -f     # live: cell-x.sock  DENY /etc/shadow
+./sand lsm -f     # unified live stream — the daemon also carries
+                  # agentmon's tracepoint probes (registered cells):
+                  #   cell-x.sock  EXEC node[123] /usr/bin/node
+                  #   cell-x.sock  OPEN node[123] /home/agent/.config
+                  #   cell-x.sock  NET  node[123] connect 104.18.7.85:443
+                  #   cell-x.sock  TRIP mount[123] blocked syscall mount (165)
+                  #   cell-x.sock  DENY node[123] /etc/shadow
+./sand lsm -f deny,trip   # only the high-signal classes
+                  # (classes: deny,exec,open,net,trip; default all)
 
 # hot policy updates on RUNNING cells — works even on cells that
 # were started WITHOUT --secure; effective on the very next open:

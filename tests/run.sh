@@ -192,8 +192,30 @@ if lsmok; then
     : > "$LOG"
     t_out "host unaffected"   "$(cat /etc/hostname)"  cat /etc/hostname
     sleep 0.5
-    grep -q "DENY /etc/hostname" "$RT/follow.log" \
+    grep -qE "DENY .*/etc/hostname" "$RT/follow.log" \
         && pass "event streamed with cell name" || fail "event streamed"
+
+    # unified stream: tracepoint events ride the same watcher
+    ./sand exec "$SOCK" -- /bin/echo probe >>"$LOG" 2>&1
+    ./sand exec "$SOCK" -- mount -t tmpfs none /tmp >>"$LOG" 2>&1
+    : > "$LOG"
+    sleep 0.5
+    grep -q "EXEC " "$RT/follow.log" && pass "exec event streamed" \
+                                     || fail "exec event streamed"
+    grep -q "TRIP " "$RT/follow.log" && pass "trip event streamed" \
+                                     || fail "trip event streamed"
+
+    # class filter: watcher sees only what it asked for
+    ./sand lsm -f deny >"$RT/follow2.log" 2>&1 &
+    W2=$!
+    sleep 0.5
+    ./sand exec "$SOCK" -- /bin/echo f2probe >>"$LOG" 2>&1
+    ./sand exec "$SOCK" -- cat /etc/hostname >>"$LOG" 2>&1
+    : > "$LOG"
+    sleep 0.5
+    kill "$W2" 2>/dev/null
+    if grep -q "DENY " "$RT/follow2.log" && ! grep -q "EXEC " "$RT/follow2.log"
+    then pass "watch class filter"; else fail "watch class filter"; fi
     kill "$WATCH" 2>/dev/null
 
     # hot allow -> readable again
