@@ -25,12 +25,17 @@ jobs:
       - name: allow unprivileged user namespaces
         run: sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0 || true
 
+      # direct probe: prints sand's own error message into the CI log
+      # when the payload can't start (diagnostics for sandbox failures)
+      - name: sandbox probe
+        run: ./sand -- /bin/echo hi || true
+
       # the full regression suite (tests/run.sh).  Passwordless sudo on
       # the runner unlocks the privileged tiers: agentmon probes run;
       # the agentlsm tier skips unless the runner kernel has "bpf" in
       # /sys/kernel/security/lsm (Ubuntu's default LSM list doesn't).
       - name: make check
-        run: make check 2>&1 | tee check.log
+        run: set -o pipefail && make check 2>&1 | tee check.log
 
       - name: upload check log on failure
         if: failure()

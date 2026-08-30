@@ -18,7 +18,9 @@ LOG="$RT/suite.log"
 C_R=$'\033[31m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_B=$'\033[1m'; C_0=$'\033[0m'
 n_pass=0; n_fail=0; n_skip=0
 pass(){ n_pass=$((n_pass+1)); printf '  %sok%s   %s\n' "$C_G" "$C_0" "$1"; }
-fail(){ n_fail=$((n_fail+1)); printf '  %sFAIL%s %s   (log: %s)\n' "$C_R" "$C_0" "$1" "$LOG"; }
+fail(){ n_fail=$((n_fail+1)); printf '  %sFAIL%s %s   (log: %s)\n' "$C_R" "$C_0" "$1" "$LOG"
+        # keep a per-test copy for the end-of-suite dump (CI debugging)
+        cp "$LOG" "$RT/fail-$1.log" 2>/dev/null; }
 skip(){ n_skip=$((n_skip+1)); printf '  %sskip%s %s (%s)\n' "$C_Y" "$C_0" "$1" "${2:-}"; }
 section(){ printf '\n%s== %s ==%s\n' "$C_B" "$1" "$C_0"; }
 
@@ -283,4 +285,11 @@ fi
 # ---- summary ------------------------------------------------------------
 printf '\n%s%d passed, %d failed, %d skipped%s\n' \
     "$C_B" "$n_pass" "$n_fail" "$n_skip" "$C_0"
+if [ "$n_fail" != 0 ]; then
+    for f in "$RT"/fail-*.log; do
+        [ -e "$f" ] || continue
+        printf '\n%s== log: %s ==%s\n' "$C_B" "$(basename "$f" .log)" "$C_0"
+        cat "$f"
+    done
+fi
 [ "$n_fail" = 0 ]
