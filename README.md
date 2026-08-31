@@ -293,6 +293,11 @@ Trust model: the control socket is 0666 — any local user can register
 policy for any cgroup id. Fine on a single-user workstation; needs peer
 credentials + an allowlist before multi-user use.
 
+## Docs
+
+- [AgentCell OS](docs/agentcell-os.md) — dedicated host/kernel redesign for speed
+  (cell pool, erofs root, thin LSM stack). Not required to run `sand` today.
+
 ## Testing
 
 ```bash
