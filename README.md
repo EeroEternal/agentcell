@@ -10,8 +10,8 @@ No Docker, no container runtime, no daemon — and it runs **fully unprivileged*
 │  5. seccomp-BPF   hand-built sock_filter, binary-search tree    │
 │                    (modules, ptrace, bpf, mount-API, io_uring…) │
 │  4. Landlock LSM  path allowlist: where R / W / X is allowed    │
-│  3. mount ns      tmpfs root + pivot_root; /usr /etc ro binds;  │
-│                    fresh /proc /dev /sys; rw tmpfs /tmp /run    │
+│  3. mount ns      tmpfs root + pivot_root; /usr /etc ro binds   │
+│                    or --rootfs DIR; fresh /proc /dev; tmpfs /tmp│
 │  2. namespaces    user+pid+net+ipc+uts+cgroup via clone(2)      │
 │                    uid 0 inside == your uid outside             │
 │  1. cgroup v2     cpu.max / memory.max / pids.max / io.max      │
@@ -46,7 +46,8 @@ audit trail the agent cannot see or disable.
 Requires: `clang` (for eBPF), `libbpf`, `libelf`, `zlib`, `xxd` (vim-common).
 
 ```bash
-make          # -> sand (launcher, unprivileged) + agentmon (eBPF monitor, root)
+make          # -> sand (unprivileged) + agentmon + agentlsm (eBPF, root)
+make check    # regression suite
 ```
 
 ## Usage
@@ -77,8 +78,16 @@ make          # -> sand (launcher, unprivileged) + agentmon (eBPF monitor, root)
 ```
 
 Inside the sandbox: workspace is `/home/agent` (rw, `~/agent-work` on the
-host), scratch is `/tmp` (tmpfs — RAM speed), full toolchain read-only at
-`/usr`, host files don't exist at all.
+host), scratch is `/tmp` (tmpfs — RAM speed), toolchain read-only at
+`/usr` (host tree, or `--rootfs`). Host home and other files do not exist.
+
+Pre-warm cells so each command skips `clone` (same isolation, serve protocol):
+
+```bash
+python3 os/agentcelld/pool.py --size 4
+python3 os/agentcelld/pool.py exec -- echo hi
+python3 examples/client.py          # batch / streaming / interactive agent
+```
 
 ## Real networking (`--net veth`)
 
@@ -299,8 +308,9 @@ credentials + an allowlist before multi-user use.
 
 ## Docs
 
-- [AgentCell OS](docs/agentcell-os.md) — dedicated host/kernel redesign for speed
-  (cell pool, erofs root, thin LSM stack). Not required to run `sand` today.
+- [AgentCell OS](docs/agentcell-os.md) — dedicated host/kernel for speed
+- [os/](os/README.md) — phase-1 tree: kernel fragment, cell-root packer, **cell pool** (`pool.py`)
+- [examples/client.py](examples/client.py) — Python: complete output + exit code over the exec protocol
 
 ## Testing
 

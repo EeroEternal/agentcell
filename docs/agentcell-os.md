@@ -262,7 +262,7 @@ python3 os/agentcelld/pool.py --size 4
 python3 os/agentcelld/pool.py exec -- echo hi
 ```
 
-Still missing for a real OS image: mkosi/archiso, `sand --rootfs`, pooled veth at daemon start.
+`sand --rootfs DIR` is implemented: the jail binds that tree instead of the live `/usr`. Still missing for a bootable image: mkosi/archiso and pooled veth at daemon start.
 
 ## Related
 
