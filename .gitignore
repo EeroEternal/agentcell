@@ -6,3 +6,4 @@ agentlsm
 src/agentlsm.bpf.o
 src/agentlsm.bpf.h
 src/vmlinux.h
+os/out/
