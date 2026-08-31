@@ -220,6 +220,10 @@ def main():
             extra = args[i + 1:]; break
         else:
             extra.append(args[i]); i += 1
+    default_root = os.path.join(ROOT, "os", "out", "cell-root")
+    if os.path.isdir(default_root) and "--rootfs" not in extra:
+        extra = ["--rootfs", default_root, *extra]
+        print(f"pool: using --rootfs {default_root}", flush=True)
     cmd_serve(size, extra)
     return 0
 

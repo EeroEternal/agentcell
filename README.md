@@ -52,6 +52,14 @@ make check    # regression suite
 
 ## Usage
 
+Fast path on Arch (packed rootfs + pre-warmed cells — no `clone` per command):
+
+```bash
+make fast                    # packs os/out/cell-root, starts a pool of 4
+# another terminal:
+make pool-exec CMD='echo hi'
+```
+
 ```bash
 # OS view from a packed tree instead of bind-mounting the live /usr
 # (os/cell-root/build.sh --minimal /tmp/cell-root)

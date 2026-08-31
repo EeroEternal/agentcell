@@ -55,6 +55,26 @@ src/vmlinux.h:
 check: all
 	tests/run.sh
 
+# Fast path on Arch: packed rootfs + pre-warmed cells (no clone per command)
+ROOTFS ?= os/out/cell-root
+SIZE   ?= 4
+
+rootfs:
+	os/cell-root/build.sh --minimal $(ROOTFS)
+
+rootfs-host:
+	os/cell-root/build.sh --from-host $(ROOTFS)
+
+pool: sand
+	@[ -d $(ROOTFS)/usr ] || $(MAKE) rootfs
+	python3 os/agentcelld/pool.py --size $(SIZE) -- --rootfs $(abspath $(ROOTFS))
+
+pool-exec: sand
+	python3 os/agentcelld/pool.py exec -- $(CMD)
+
+fast: sand rootfs
+	os/fast.sh
+
 all: sand agentmon agentlsm
 
-.PHONY: all clean check
+.PHONY: all clean check rootfs rootfs-host pool pool-exec fast
