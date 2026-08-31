@@ -19,13 +19,12 @@ python3 os/agentcelld/pool.py --size 4          # pre-warm 4 cells
 python3 os/agentcelld/pool.py exec -- echo hi   # ~serve-mode latency, no new clone
 ```
 
-Build a cell-root image (needs `squashfs-tools` or `erofs-utils`):
+Pack a directory tree and boot the jail from it (no live `/usr` bind):
 
 ```bash
-os/cell-root/build.sh --minimal /tmp/cell-root.img
-# later: sand --bind-ro /tmp/cell-root.img:/usr  is the wrong shape;
-# the image is a *filesystem*. Mount it and point sand at that tree
-# once sand grows an explicit --rootfs flag (tracked in the design doc).
+os/cell-root/build.sh --minimal /tmp/cell-root
+./sand --rootfs /tmp/cell-root -- echo hi
+# .img / .squashfs: needs mkfs.erofs or mksquashfs; then mount and pass the mountpoint
 ```
 
 ## What “creating the OS” still needs

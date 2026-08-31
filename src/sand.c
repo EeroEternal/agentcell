@@ -129,7 +129,7 @@ static void bind_mount(const char *src, const char *dst, int ro, int rec)
                   (rec ? MS_REC : 0), NULL) < 0) {
             char msg[PATH_MAX * 2];
             snprintf(msg, sizeof msg, "remount ro %s", dst);
-            die(msg);
+            warn2(msg);   /* EPERM if src sb is init-userns (tmpfs); Landlock still RO */
         }
 }
 
@@ -152,6 +152,7 @@ struct cfg {
     int  netmode;                   /* NET_NONE | NET_HOST | NET_VETH */
     char veth_if[64], veth_ip[64], veth_gw[64];   /* --net veth */
     char workdir[PATH_MAX];
+    char rootfs[PATH_MAX];          /* --rootfs DIR; empty = host /usr /etc */
     char *ro[MAXBIND]; int n_ro;
     char *rw[MAXBIND]; int n_rw;
     struct bind { char src[PATH_MAX]; char dst[PATH_MAX]; int ro; }
@@ -174,6 +175,7 @@ static struct cfg C = {
     .pids      = 256,
     .netmode  = NET_NONE,
     .workdir   = "",
+    .rootfs    = "",
 };
 
 static uid_t g_uid;
@@ -419,21 +421,45 @@ static void cgroup_setup(void)
  * Needed because distros disagree on usrmerge targets: Arch has
  * /lib64 -> usr/lib, Ubuntu has /lib64 -> usr/lib64 — hardcoding
  * either breaks the ELF interpreter path on the other. */
+/* host path for the OS view: --rootfs DIR prefixes, else the real / */
+static void os_src(char *out, size_t n, const char *abs)
+{
+    if (C.rootfs[0])
+        snprintf(out, n, "%s%s", C.rootfs, abs);
+    else
+        snprintf(out, n, "%s", abs);
+}
+
 static void mirror_top(const char *path)
 {
-    char p[PATH_MAX], tgt[PATH_MAX];
+    char p[PATH_MAX], tgt[PATH_MAX], src[PATH_MAX];
     struct stat st;
+    os_src(src, sizeof src, path);
     NR(path);
-    if (lstat(path, &st) < 0) return;
+    if (lstat(src, &st) < 0) return;
     if (S_ISLNK(st.st_mode)) {
-        ssize_t n = readlink(path, tgt, sizeof tgt - 1);
+        ssize_t n = readlink(src, tgt, sizeof tgt - 1);
         if (n <= 0) return;
         tgt[n] = 0;
         if (symlink(tgt, p) && errno != EEXIST) die(path);
     } else {
         mmkdir(p, 0755);
-        bind_mount(path, p, 1, 1);
+        bind_mount(src, p, 1, 1);
     }
+}
+
+static void bind_os_ro(const char *abs, int required)
+{
+    char src[PATH_MAX], p[PATH_MAX];
+    struct stat st;
+    os_src(src, sizeof src, abs);
+    if (lstat(src, &st) < 0) {
+        if (required) die(src);
+        return;
+    }
+    NR(abs);
+    mmkdir(p, 0755);
+    bind_mount(src, p, 1, 1);
 }
 
 static void do_mounts(void)
@@ -448,10 +474,11 @@ static void do_mounts(void)
     if (mount("tmpfs", g_newroot, "tmpfs", MS_NOSUID, "size=16m,mode=0755") < 0)
         die("newroot tmpfs");
 
-    /* read-only OS view: on Arch /bin,/lib… are symlinks into /usr */
-    NR("/usr");    mmkdir(p, 0755); bind_mount("/usr", p, 1, 1);
-    NR("/etc");    mmkdir(p, 0755); bind_mount("/etc", p, 1, 1);
-    NR("/opt");    mmkdir(p, 0755); bind_mount("/opt", p, 1, 1);
+    /* read-only OS view: host /usr /etc, or --rootfs DIR (no recursive
+     * bind of the live distro tree — cheaper start, reproducible root) */
+    bind_os_ro("/usr", 1);
+    bind_os_ro("/etc", 1);
+    bind_os_ro("/opt", 0);
 
     /* /bin /sbin /lib /lib64: mirror the host layout exactly */
     mirror_top("/bin");
@@ -1850,6 +1877,8 @@ static void usage(FILE *out)
 "  --pids N      pids.max    (default 256)\n"
 "  --net MODE    none | host | veth (default none — loopback only;\n"
 "                veth = real networking with NAT, needs agentlsm daemon)\n"
+"  --rootfs DIR  OS view from DIR instead of the host /usr /etc /opt\n"
+"                (pack with os/cell-root/build.sh; directory, not an image)\n"
 "  --workdir DIR writable workspace (default ~/agent-work)\n"
 "  --ro DIR      extra read-only bind (repeatable, lands in /mnt/NAME)\n"
 "  --rw DIR      extra read-write bind (repeatable, lands in /mnt/NAME)\n"
@@ -1916,6 +1945,7 @@ int main(int argc, char **argv)
         {"cpu",         required_argument, 0, 'c'},
         {"pids",        required_argument, 0, 'P'},
         {"net",         required_argument, 0, 'n'},
+        {"rootfs",      required_argument, 0, 1002},
         {"workdir",     required_argument, 0, 'w'},
         {"ro",          required_argument, 0, 'r'},
         {"rw",          required_argument, 0, 'W'},
@@ -1979,6 +2009,9 @@ int main(int argc, char **argv)
         case 't': C.timeout = atoi(optarg); break;
         case 1000: C.io_rbps = parse_mem(optarg); break;
         case 1001: C.io_wbps = parse_mem(optarg); break;
+        case 1002:
+            if (!realpath(optarg, C.rootfs)) die(optarg);
+            break;
         case 'd':
             if (C.n_deny < MAXBIND) {
                 snprintf(C.deny[C.n_deny], 256, "%s", optarg);
@@ -2000,6 +2033,14 @@ int main(int argc, char **argv)
         fprintf(stderr, "sand: --ask needs the seccomp filter; "
                         "ignoring --ask\n");
         C.ask = 0;
+    }
+    if (C.rootfs[0]) {
+        struct stat st;
+        if (stat(C.rootfs, &st) < 0 || !S_ISDIR(st.st_mode)) {
+            fprintf(stderr, "sand: --rootfs must be a directory "
+                            "(mount squashfs/erofs, then pass the mountpoint)\n");
+            return 2;
+        }
     }
     if (optind < argc) C.argv = (char *const *)&argv[optind];
 

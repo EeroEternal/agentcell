@@ -89,6 +89,16 @@ else
     pass "timeout kills payload"
 fi
 
+section "--rootfs"
+RF="$RT/cell-root"
+if os/cell-root/build.sh --minimal "$RF" >>"$LOG" 2>&1; then
+    t_out "rootfs echo" "hi" ./sand --rootfs "$RF" -- echo hi
+    t_no  "rootfs still seccomp" ./sand --rootfs "$RF" -- unshare -p true
+else
+    skip "rootfs echo" "cell-root build failed"
+    skip "rootfs still seccomp" "cell-root build failed"
+fi
+
 section "ask mode (seccomp user-notify)"
 if ! command -v script >/dev/null 2>&1; then
     skip "ask tests" "script(1) not found"

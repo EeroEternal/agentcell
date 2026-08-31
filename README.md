@@ -52,6 +52,10 @@ make          # -> sand (launcher, unprivileged) + agentmon (eBPF monitor, root)
 ## Usage
 
 ```bash
+# OS view from a packed tree instead of bind-mounting the live /usr
+# (os/cell-root/build.sh --minimal /tmp/cell-root)
+./sand --rootfs /tmp/cell-root -- echo hi
+
 # interactive shell inside the sandbox
 # (default: no network, 60% of RAM, all CPUs, 256 pids)
 ./sand
