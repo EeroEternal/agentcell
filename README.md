@@ -382,6 +382,7 @@ and a 1G tmpfs scratch.
 - `--ask` in serve mode (approval flow for long-lived cells)
 - per-cell egress policy: netfilter rules on the `vethh*` host ends
 - idmapped binds, if the unprivileged idmap story ever settles
+- mkosi/archiso image from `os/` (custom kernel cmdline + erofs cell-root)
 
 ## License
 
