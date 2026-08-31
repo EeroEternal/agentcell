@@ -243,6 +243,27 @@ Nothing in this document requires throwing away `sand`:
 The GitHub tree (`sand`, `agentlsm`, `examples/client.py`, web gateway) is
 the userspace; this OS is the **environment** that makes that userspace cheap.
 
+## Implementation in this repo (phase 1)
+
+A bootable ISO is **not** shipped. Concrete files under [`os/`](../os/README.md):
+
+| Path | Role |
+|---|---|
+| `os/kernel/agentcell.config` | kconfig fragment to merge |
+| `os/kernel/cmdline` | `lsm=landlock,capability,yama,bpf` |
+| `os/cell-root/build.sh` | pack squashfs/erofs cell-root |
+| `os/agentcelld/pool.py` | pre-warm `sand serve` workers (**runs today**) |
+| `os/systemd/agentcelld.service` | example unit |
+
+The pool is the process-model win without a new kernel: clone once per worker, then `exec` only.
+
+```bash
+python3 os/agentcelld/pool.py --size 4
+python3 os/agentcelld/pool.py exec -- echo hi
+```
+
+Still missing for a real OS image: mkosi/archiso, `sand --rootfs`, pooled veth at daemon start.
+
 ## Related
 
 - Runtime: `README.md` (usage, `sand serve`, `--net veth`, `--overlay`, `io.max`)

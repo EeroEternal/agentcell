@@ -1,0 +1,11 @@
+# Boot command line for a dedicated AgentCell host.
+# Merge into the bootloader (GRUB: GRUB_CMDLINE_LINUX, systemd-boot: options).
+#
+# landlock = path policy in sand
+# bpf      = optional; only if you run `agentlsm serve`
+# capability,yama = usual baseline
+# Do NOT include apparmor or selinux on this host.
+
+lsm=landlock,capability,yama,bpf
+cgroup_no_v1=all
+audit=0

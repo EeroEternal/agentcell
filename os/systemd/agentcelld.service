@@ -1,0 +1,12 @@
+[Unit]
+Description=AgentCell cell pool (pre-warmed sand serve)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/share/agentcell/os/agentcelld/pool.py --size 4
+Restart=on-failure
+# Unprivileged: User= your agent user. Do not run the pool as root.
+
+[Install]
+WantedBy=multi-user.target
