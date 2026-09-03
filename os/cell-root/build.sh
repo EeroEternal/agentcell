@@ -32,7 +32,10 @@ copy_bin() {
     ldd "$p" 2>/dev/null | awk '/=>/ {print $3} /^[[:space:]]*\// {print $1}' | while read -r so; do
         [ -f "$so" ] || continue
         mkdir -p "$ST$(dirname "$so")"
-        cp -an "$so" "$ST$so" 2>/dev/null || true
+        # -L: dereference.  Ubuntu's ld-linux is itself a symlink
+        # (../lib/x86_64-linux-gnu/...) — cp -a would copy a DANGLING
+        # link and every payload would die with execvp ENOENT
+        cp -anL "$so" "$ST$so" 2>/dev/null || true
     done
 }
 
