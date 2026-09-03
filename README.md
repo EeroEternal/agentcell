@@ -316,6 +316,7 @@ credentials + an allowlist before multi-user use.
 
 ## Docs
 
+- [RFC 0001: Keel & Zene Integration Roadmap](docs/rfcs/0001-keel-zene-integration.md) — requirements for ARM64, duplex MCP streaming, egress proxy, and Rust FFI.
 - [AgentCell OS](docs/agentcell-os.md) — dedicated host/kernel for speed
 - [os/](os/README.md) — phase-1 tree: kernel fragment, cell-root packer, **cell pool** (`pool.py`)
 - [examples/client.py](examples/client.py) — Python: complete output + exit code over the exec protocol
