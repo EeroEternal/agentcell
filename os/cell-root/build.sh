@@ -26,8 +26,10 @@ copy_bin() {
     p=$(type -P "$b" 2>/dev/null) || p="/usr/bin/$b"
     [ -f "$p" ] || return 0
     cp -a "$p" "$dest/"
-    # copy .so deps (best-effort)
-    ldd "$p" 2>/dev/null | awk '/=>/ {print $3} /^\// {print $1}' | while read -r so; do
+    # copy .so deps (best-effort).  ldd prints the ELF interpreter as
+    # "  /lib64/ld-linux... (0x...)" on Ubuntu (leading blanks, no "=>")
+    # but as "/lib64/... => /lib64/..." on Arch — match both shapes
+    ldd "$p" 2>/dev/null | awk '/=>/ {print $3} /^[[:space:]]*\// {print $1}' | while read -r so; do
         [ -f "$so" ] || continue
         mkdir -p "$ST$(dirname "$so")"
         cp -an "$so" "$ST$so" 2>/dev/null || true
@@ -53,12 +55,10 @@ else
     done
     ln -sfn usr/bin "$ST/bin"
     mkdir -p "$ST/usr/lib"
-    ln -sfn usr/lib "$ST/lib"
-    if [ -e "$ST/usr/lib64" ]; then
-        ln -sfn usr/lib64 "$ST/lib64"
-    else
-        ln -sfn usr/lib "$ST/lib64"
-    fi
+    # Ubuntu ldd copies land in real lib/ and lib64/ dirs — keep those
+    # (they already satisfy the interpreter path); symlink only if empty
+    [ -e "$ST/lib" ]   || ln -sfn usr/lib "$ST/lib"
+    [ -e "$ST/lib64" ] || ln -sfn usr/lib "$ST/lib64"
 fi
 
 case $OUT in
