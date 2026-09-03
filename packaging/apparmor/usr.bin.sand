@@ -1,0 +1,21 @@
+# AppArmor profile for AgentCell unprivileged sandboxing
+# Required on Ubuntu 24.04+ (Noble Numbat) where kernel.apparmor_restrict_unprivileged_userns = 1
+# Install to /etc/apparmor.d/usr.bin.sand and reload with:
+#   sudo apparmor_parser -r /etc/apparmor.d/usr.bin.sand
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile sand /usr/local/bin/sand flags=(unconfined) {
+  userns,
+  mount,
+  pivot_root,
+  include if exists <local/usr.bin.sand>
+}
+
+profile sand_bin /usr/bin/sand flags=(unconfined) {
+  userns,
+  mount,
+  pivot_root,
+  include if exists <local/usr.bin.sand>
+}
