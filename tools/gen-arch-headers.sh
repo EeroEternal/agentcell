@@ -64,6 +64,13 @@ emit() {   # emit <archname> <AUDIT_ARCH> <header path>
         done
         echo
         echo
+        # tracepoint section names for the TRIP probes (historic aliases)
+        for s in $TRIP; do
+            local tp=$s
+            if [ "$s" = "umount2" ]; then tp=umount; fi
+            echo "#define AC_TP_$s $tp"
+        done
+        echo
         # runtime table: deny list + attempt naming (absent syscalls skipped)
         echo "/* {nr, name} pairs — absent syscalls are simply left out */"
         echo "struct ac_sys { int nr; const char *name; };"

@@ -66,6 +66,30 @@
 
 #define AC_TRIP_X X(mount) X(umount2) X(pivot_root) X(unshare) X(setns) X(clone3) X(bpf) X(perf_event_open) X(ptrace) X(keyctl) X(init_module) X(delete_module) X(userfaultfd) X(io_uring_setup) X(fsopen) X(fsconfig) X(fsmount) X(fspick) X(move_mount) X(open_tree) X(mount_setattr)
 
+#define AC_TP_mount mount
+#define AC_TP_umount2 umount
+#define AC_TP_pivot_root pivot_root
+#define AC_TP_unshare unshare
+#define AC_TP_setns setns
+#define AC_TP_clone3 clone3
+#define AC_TP_bpf bpf
+#define AC_TP_perf_event_open perf_event_open
+#define AC_TP_ptrace ptrace
+#define AC_TP_keyctl keyctl
+#define AC_TP_init_module init_module
+#define AC_TP_delete_module delete_module
+#define AC_TP_userfaultfd userfaultfd
+#define AC_TP_io_uring_setup io_uring_setup
+#define AC_TP_fsopen fsopen
+#define AC_TP_fsconfig fsconfig
+#define AC_TP_fsmount fsmount
+#define AC_TP_fspick fspick
+#define AC_TP_move_mount move_mount
+#define AC_TP_open_tree open_tree
+#define AC_TP_mount_setattr mount_setattr
+#define AC_TP_ioperm ioperm
+#define AC_TP_iopl iopl
+
 /* {nr, name} pairs — absent syscalls are simply left out */
 struct ac_sys { int nr; const char *name; };
 #define AC_SYSCALL_TAB \

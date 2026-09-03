@@ -119,12 +119,10 @@ int tp_connect(struct tp_sys_enter *ctx)
  * KNOW about.  The per-arch list comes from src/arch headers (AC_TRIP_X);
  * util-linux's tracepoint kept the historic name "umount" for
  * umount2(2) — alias it. */
-#define AC_CAT3(a, b) a##b
-#define AC_CAT(a, b) AC_CAT3(a, b)
-#define AC_TP_umount2 umount
-#define TPNAME(s) AC_CAT(AC_TP_, s)
 #define AC_STR2(x) #x
 #define AC_STR(x) AC_STR2(x)
+/* TPNAME: per-name tracepoint alias from src/arch (umount2 -> umount) */
+#define TPNAME(s) AC_TP_##s
 
 #define ATTEMPT(name)                                                     \
 SEC("tracepoint/syscalls/sys_enter_" AC_STR(TPNAME(name)))                \
