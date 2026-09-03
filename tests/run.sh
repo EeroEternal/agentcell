@@ -86,10 +86,10 @@ if cat > "$RT/acchk.c" <<'ACEOF'
     bad++; } } while (0)
 int main(void) {
     int bad = 0;
-    CHK(mount) CHK(umount2) CHK(pivot_root) CHK(unshare) CHK(setns)
-    CHK(bpf) CHK(ptrace) CHK(keyctl) CHK(reboot) CHK(fanotify_init)
-    CHK(clone) CHK(clone3) CHK(execve) CHK(openat) CHK(connect)
-    CHK(fsopen) CHK(move_mount) CHK(io_uring_setup) CHK(userfaultfd)
+    CHK(mount); CHK(umount2); CHK(pivot_root); CHK(unshare); CHK(setns);
+    CHK(bpf); CHK(ptrace); CHK(keyctl); CHK(reboot); CHK(fanotify_init);
+    CHK(clone); CHK(clone3); CHK(execve); CHK(openat); CHK(connect);
+    CHK(fsopen); CHK(move_mount); CHK(io_uring_setup); CHK(userfaultfd);
     printf(bad ? "BAD\n" : "OK\n");
     return bad;
 }
