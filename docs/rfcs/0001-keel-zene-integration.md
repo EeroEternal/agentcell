@@ -22,6 +22,12 @@ This RFC outlines the requirements, architectural adjustments, and proposed chan
 ## 2. Friction Points & Gap Analysis
 
 ### Gap 1: Architecture Limitation (x86_64 only)
+- **Status: SATISFIED on main** — syscall numbers are now GENERATED per
+  arch (src/arch/{x86_64,aarch64}.h from kernel uapi headers, `make arch`),
+  the seccomp filter, BPF probes and naming tables all consume the
+  abstract AC_SYS_* set, and the suite cross-checks the table against
+  glibc SYS_*.  Absent syscalls drop out automatically.  A native arm64
+  build compiles as-is; BPF needs arm64 vmlinux.h on the target host.
 - **Current State**: `src/sand.c` and `src/agentmon.bpf.c` hardcode x86_64 syscall numbers (e.g. `__NR_mount 165`, `__NR_unshare 272`, `__NR_clone 56`, `AUDIT_ARCH_X86_64`).
 - **Impact**: AI Agent developers heavily utilize Apple Silicon (M-series, ARM64) for local development, and modern cloud providers deploy cost-effective AArch64 instances (AWS Graviton, GCP Tau T2A). Currently, AgentCell cannot build or run on ARM64.
 - **Requirement**: Abstract syscall definitions into architecture-specific header tables (`arch/x86_64.h` and `arch/aarch64.h`), parameterizing the BPF seccomp filter and tracepoint probes by architecture.
