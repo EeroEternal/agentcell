@@ -27,11 +27,18 @@ This RFC outlines the requirements, architectural adjustments, and proposed chan
 - **Requirement**: Abstract syscall definitions into architecture-specific header tables (`arch/x86_64.h` and `arch/aarch64.h`), parameterizing the BPF seccomp filter and tracepoint probes by architecture.
 
 ### Gap 2: Interactive Process & Duplex Stdio Streaming (MCP Servers)
-- **Current State**: AgentCell is designed primarily around a batch, run-to-completion model (`sand -- <cmd>` or `POST /api/cells/<id>/exec`).
-- **Impact**:
-  - Coding agents require **long-running interactive processes** (e.g., persistent test servers, REPLs, or processes requiring interactive stdin confirmation).
-  - Crucially, AI agent runtimes host **Model Context Protocol (MCP)** servers, which communicate continuously over standard I/O pipes (`stdin`/`stdout`) via JSON-RPC. A batch-oriented execution API cannot sustain persistent duplex streams without process exit.
-- **Requirement**: Provide a continuous duplex streaming protocol over Unix domain sockets for `sand serve` (or an interactive mode in `sand` exposing separate unbuffered stdin/stdout/stderr pipes with PID management).
+- **Status: SATISFIED on main** — exec protocol v2 (commit 3934993) made the
+  serve socket full-duplex after the argv header: client bytes are live stdin
+  (SHUT_WR = EOF), stdout/stderr stream back with a 4-byte exit trailer, and
+  the jailed process stays alive as long as stdin stays open.
+  `examples/client.py` (`Cell.session` + `Session.read_until(sentinel)`) is the
+  MCP-stdio shape. Remaining follow-ups: signal delivery ( Proposal B ) and
+  stderr as a separate channel.
+- **Original analysis** (pre-v2, kept for history): AgentCell was designed
+  primarily around a batch, run-to-completion model (`sand -- <cmd>` or
+  `POST /api/cells/<id>/exec`); a batch-oriented execution API cannot sustain
+  persistent duplex streams without process exit. MCP servers communicate
+  continuously over stdin/stdout via JSON-RPC and need exactly that.
 
 ### Gap 3: Fine-Grained Domain-Level Network Egress Filtering
 - **Current State**: Network policy is binary: either `--net none` (only isolated loopback) or `--net host` (full host network access).
