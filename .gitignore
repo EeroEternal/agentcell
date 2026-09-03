@@ -7,3 +7,6 @@ src/agentlsm.bpf.o
 src/agentlsm.bpf.h
 src/vmlinux.h
 os/out/
+ffi-demo
+libagentcell.a
+libagentcell.o
