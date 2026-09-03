@@ -160,6 +160,20 @@ else
     skip "io.max throttles workdir writes" "io controller not delegated (README has the one-liner)"
 fi
 
+section "c api (libagentcell)"
+if make lib ffi-demo >>"$LOG" 2>&1; then
+    pass "lib + ffi-demo build"
+    if out=$(./ffi-demo 2>>"$LOG") && [ "$(echo "$out" | grep -c 'exit code: 7')" = 1 ]; then
+        pass "agentcell_spawn: output + exact exit code"
+    else
+        fail "agentcell_spawn: output + exact exit code"
+        echo "$out" >> "$LOG"
+    fi
+    ./ffi-demo > /dev/null 2>&1 || true
+else
+    fail "lib + ffi-demo build"
+fi
+
 section "serve mode + exec protocol"
 ./sand serve --timeout 60 >"$RT/serve.out" 2>&1 &
 CELL_PID=$!
@@ -325,6 +339,19 @@ if lsmok; then
           ./sand --net veth -- ip route show
     t_out "veth NAT + DNS outbound" "HTTP" \
           ./sand --net veth -- curl -sI --max-time 5 https://example.com
+
+    # egress allowlist: DNS + the one allowed dst pass, all else DROP
+    t_out "egress: allowed dst reachable" "HTTP" \
+          ./sand --net veth --egress 1.1.1.1:443 -- \
+          curl --noproxy '*' -sI --max-time 6 https://1.1.1.1
+    if ./sand --net veth --egress 1.1.1.1:443 -- \
+          curl --noproxy '*' -sI --max-time 4 https://8.8.8.8 >>"$LOG" 2>&1; then
+        fail "egress: other dsts blocked"
+    else
+        pass "egress: other dsts blocked"
+    fi
+    t_out "egress: DNS still allowed" "example" \
+          ./sand --net veth --egress 1.1.1.1:443 -- getent hosts example.com
 
     # block-all, scoped to a throwaway cell: kernel-side time-bounded
     # deny-everything window.  The SYSTEM-WIDE variant is intentionally

@@ -46,6 +46,7 @@
 #include <bpf/libbpf.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <netdb.h>
 #include <stdarg.h>
 #include <poll.h>
 #include <signal.h>
@@ -273,7 +274,8 @@ static int on_evt(void *ctx, void *data, size_t size)
  * touches (veth ends, iptables rules, ip_forward) is reversed on exit.
  */
 static __u64 g_netmap[256];                    /* 16384 /30s, one bit each */
-static struct { pid_t pid; int idx; } g_nets[64];
+static struct { pid_t pid; int idx;
+                char egip[64]; char egport[8]; } g_nets[64];
 static int   g_nat_on;
 static int   g_fwd_save = -1;
 
@@ -316,7 +318,24 @@ static void nat_teardown(void)
     }
 }
 
-static int net_up(pid_t pid, char *rep, size_t repn)
+/* --egress H:P: per-cell outbound allowlist on the FORWARD chain —
+ * DNS + the one proxy dst pass, everything else from that veth is
+ * dropped.  Rules sit ABOVE the global 10.200/16 ACCEPTs (inserted
+ * with -I in reverse order). */
+static void egress_rules(int idx, const char *ip, const char *port, int add)
+{
+    const char *op = add ? "-I FORWARD 1" : "-D FORWARD";
+    sh("iptables %s FORWARD -i vethh%d -j DROP 2>/dev/null", op, idx);
+    sh("iptables %s FORWARD -i vethh%d -m conntrack "
+       "--ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null", op, idx);
+    sh("iptables %s FORWARD -i vethh%d -p tcp -d %s --dport %s "
+       "-j ACCEPT 2>/dev/null", op, idx, ip, port);
+    sh("iptables %s FORWARD -i vethh%d -p udp --dport 53 "
+       "-j ACCEPT 2>/dev/null", op, idx);
+}
+
+static int net_up(pid_t pid, char *rep, size_t repn,
+                  const char *eg_host, const char *eg_port)
 {
     int slot = -1;
     for (int i = 0; i < 64; i++)
@@ -351,6 +370,26 @@ static int net_up(pid_t pid, char *rep, size_t repn)
     nat_ensure();
     g_nets[slot].pid = pid;
     g_nets[slot].idx = idx;
+    g_nets[slot].egip[0] = g_nets[slot].egport[0] = 0;
+    if (eg_host && eg_port) {
+        /* resolve the proxy target once, on the host side */
+        struct addrinfo hints = { .ai_family = AF_INET }, *ai;
+        if (getaddrinfo(eg_host, NULL, &hints, &ai) || !ai) {
+            sh("ip link del vethh%d 2>/dev/null", idx);
+            goto fail;
+        }
+        struct sockaddr_in *sin = (void *)ai->ai_addr;
+        if (!inet_ntop(AF_INET, &sin->sin_addr,
+                       g_nets[slot].egip, sizeof g_nets[slot].egip)) {
+            freeaddrinfo(ai);
+            sh("ip link del vethh%d 2>/dev/null", idx);
+            goto fail;
+        }
+        freeaddrinfo(ai);
+        snprintf(g_nets[slot].egport, sizeof g_nets[slot].egport,
+                 "%s", eg_port);
+        egress_rules(idx, g_nets[slot].egip, g_nets[slot].egport, 1);
+    }
     snprintf(rep, repn, "OK vethc%d 10.200.%u.%u 10.200.%u.%u\n",
              idx, (b + 2) >> 8, (b + 2) & 255, (b + 1) >> 8, (b + 1) & 255);
     return 0;
@@ -363,9 +402,12 @@ static void net_down(pid_t pid)
 {
     for (int i = 0; i < 64; i++) {
         if (g_nets[i].pid != pid) continue;
+        if (g_nets[i].egip[0])
+            egress_rules(g_nets[i].idx, g_nets[i].egip, g_nets[i].egport, 0);
         sh("ip link del vethh%d 2>/dev/null", g_nets[i].idx);
         g_netmap[g_nets[i].idx >> 6] &= ~(1ULL << (g_nets[i].idx & 63));
         g_nets[i].pid = 0;
+        g_nets[i].egip[0] = 0;
     }
 }
 
@@ -469,8 +511,11 @@ static void serve_line(int ci, char *line)
         snprintf(rep, sizeof rep, "OK\n");
     } else if (!strncmp(line, "NETUP ", 6)) {
         long pid;
-        if (sscanf(line + 6, "%ld", &pid) == 1 &&
-            !net_up((pid_t)pid, rep, sizeof rep))
+        char eh[128] = "", ep[8] = "";
+        int n = sscanf(line + 6, "%ld EGRESS %127s %7s", &pid, eh, ep);
+        if (n >= 1 &&
+            !net_up((pid_t)pid, rep, sizeof rep,
+                    n == 3 ? eh : NULL, n == 3 ? ep : NULL))
             ;                                   /* net_up filled rep */
         else
             snprintf(rep, sizeof rep, "ERR netup\n");

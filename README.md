@@ -314,6 +314,43 @@ Trust model: the control socket is 0666 — any local user can register
 policy for any cgroup id. Fine on a single-user workstation; needs peer
 credentials + an allowlist before multi-user use.
 
+## C API (`libagentcell`, for hosts like Keel)
+
+RFC 0001 Gap 5: the exact isolation code the CLI runs, as a linkable
+C ABI — no fork/exec of `sand`, no output parsing:
+
+```c
+#include "agentcell.h"
+pid_t pid;
+agentcell_spawn(&cfg, argv, envp, in_fd, out_fd, out_fd, &pid);
+/* stream stdio with the fds you passed … */
+waitpid(pid, &st, 0);        /* exact exit code */
+agentcell_release(pid);      /* veth/egress rules, LSM, cgroup teardown */
+```
+
+```bash
+make lib ffi-demo && ./ffi-demo   # hi-from-ffi, id -u = 0, exit 7
+```
+
+`make lib` builds `libagentcell.a` (unity build of sand.c; `die()`
+longjmps instead of exiting). Not thread-safe — serialize spawns.
+Rust hosts bind the same ABI with a small `agentcell-sys` crate.
+
+## Fine-grained egress (`--egress`)
+
+Outbound allowlist for agents that need exactly one API endpoint:
+
+```bash
+sudo ./agentlsm serve                       # once per boot
+./sand --egress api.openai.com:443 -- agent # implies --net veth
+```
+
+Inside the cell: `http_proxy`/`https_proxy` are set to the target.
+At the host firewall the daemon installs per-cell rules on the
+veth: **DNS (53) + the given dst pass, everything else DROPs**
+(rules removed with the cell). Proxy-aware clients use the env;
+proxy-oblivious traffic is dropped regardless.
+
 ## Docs
 
 - [RFC 0001: Keel & Zene Integration Roadmap](docs/rfcs/0001-keel-zene-integration.md) — requirements for ARM64, duplex MCP streaming, egress proxy, and Rust FFI.

@@ -55,6 +55,14 @@ src/vmlinux.h:
 check: all
 	tests/run.sh
 
+# C ABI library (RFC 0001, Gap 5) — same isolation code as the CLI
+libagentcell.a: src/libagentcell.c src/sand.c src/agentcell.h
+	$(CC) $(CFLAGS) -c src/libagentcell.c -o libagentcell.o
+	ar rcs $@ libagentcell.o
+
+ffi-demo: libagentcell.a examples/ffi_demo.c
+	$(CC) $(CFLAGS) -o ffi-demo examples/ffi_demo.c -L. -lagentcell
+
 # Fast path on Arch: packed rootfs + pre-warmed cells (no clone per command)
 ROOTFS ?= os/out/cell-root
 SIZE   ?= 4
@@ -77,4 +85,4 @@ fast: sand rootfs
 
 all: sand agentmon agentlsm
 
-.PHONY: all clean check rootfs rootfs-host pool pool-exec fast
+.PHONY: all clean check lib ffi-demo rootfs rootfs-host pool pool-exec fast

@@ -48,6 +48,7 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <sched.h>
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,9 +61,15 @@
 /* helpers                                                             */
 /* ------------------------------------------------------------------ */
 
+/* library mode (libagentcell): a fatal setup error returns to the
+ * caller instead of exiting the hosting process */
+static jmp_buf *g_die_jmp;
+
 static void die(const char *msg)
 {
     fprintf(stderr, "sand: %s: %s\n", msg, strerror(errno));
+    if (g_die_jmp)
+        longjmp(*g_die_jmp, errno > 0 ? errno : 1);
     exit(1);
 }
 
@@ -165,6 +172,7 @@ struct cfg {
     int  n_deny;
     char *ov[MAXBIND]; int n_ov;      /* --overlay DIR: copy-on-write binds */
     long io_rbps, io_wbps;          /* io.max on the workspace device (0=off) */
+    char egress_host[128], egress_port[8];  /* --egress HOST:PORT (veth only) */
     int  timeout;
     char *const *argv;
 };
@@ -185,6 +193,11 @@ static char  g_newroot[] = "/tmp/agentcell-root.XXXXXX";
 static char  g_cgpath[PATH_MAX];
 static int   g_have_cg;
 static int   g_veth_on;              /* NETUP succeeded: NETDOWN at exit */
+
+/* FFI spawn (libagentcell): stdio fds for the payload and an explicit
+ * environment; -1 / NULL = inherit the sane defaults */
+int    g_spawn_fds[3] = { -1, -1, -1 };
+char **g_spawn_envp;
 
 /* ---- long-running (serve) mode ---- */
 static int   g_serve;                 /* 1 = jail stays alive, serves execs */
@@ -1524,8 +1537,12 @@ static void lsm_unregister(void)
  * rides the sync pipe: plain "x" means fallback to no network. */
 static int net_veth_register(pid_t child)
 {
-    char cmd[64], rep[128];
-    snprintf(cmd, sizeof cmd, "NETUP %d", (int)child);
+    char cmd[256], rep[128];
+    if (C.egress_host[0])
+        snprintf(cmd, sizeof cmd, "NETUP %d EGRESS %s %s",
+                 (int)child, C.egress_host, C.egress_port);
+    else
+        snprintf(cmd, sizeof cmd, "NETUP %d", (int)child);
     if (lsm_cmd(cmd, rep, sizeof rep) < 0 || strncmp(rep, "OK ", 3) ||
         sscanf(rep + 3, "%63s %63s %63s",
                C.veth_if, C.veth_ip, C.veth_gw) != 3) {
@@ -1804,12 +1821,30 @@ static int child_main(void *arg)
     if (chdir("/home/agent") < 0) warn2("chdir workdir");
 
     clearenv();
-    setenv("HOME",   "/home/agent", 1);
-    setenv("PATH",   "/usr/bin:/bin", 1);
-    setenv("TMPDIR", "/tmp", 1);
-    setenv("SHELL",  "/bin/bash", 1);
-    setenv("LANG",   "C.UTF-8", 1);
-    setenv("TERM",   "xterm-256color", 1);
+    if (g_spawn_envp) {
+        for (char **e = g_spawn_envp; *e; e++) putenv(*e);
+    } else {
+        setenv("HOME",   "/home/agent", 1);
+        setenv("PATH",   "/usr/bin:/bin", 1);
+        setenv("TMPDIR", "/tmp", 1);
+        setenv("SHELL",  "/bin/bash", 1);
+        setenv("LANG",   "C.UTF-8", 1);
+        setenv("TERM",   "xterm-256color", 1);
+    }
+    if (C.egress_host[0]) {
+        char p[192];
+        snprintf(p, sizeof p, "http://%s:%s", C.egress_host, C.egress_port);
+        setenv("http_proxy",  p, 1);
+        setenv("https_proxy", p, 1);
+        setenv("all_proxy",   p, 1);
+        setenv("no_proxy", "localhost,127.0.0.1", 1);
+    }
+
+    if (g_spawn_fds[0] >= 0) {      /* FFI spawn: caller's stdio */
+        dup2(g_spawn_fds[0], 0);
+        dup2(g_spawn_fds[1], 1);
+        dup2(g_spawn_fds[2], 2);
+    }
 
     if (g_serve) {
         close(g_host_sock);
@@ -1877,6 +1912,9 @@ static void usage(FILE *out)
 "  --pids N      pids.max    (default 256)\n"
 "  --net MODE    none | host | veth (default none — loopback only;\n"
 "                veth = real networking with NAT, needs agentlsm daemon)\n"
+"  --egress H:P  outbound allowlist via --net veth: DNS + H:P only,\n"
+"                everything else DROPped at the host firewall; proxy\n"
+"                env (http_proxy etc.) is set inside the cell\n"
 "  --rootfs DIR  OS view from DIR instead of the host /usr /etc /opt\n"
 "                (pack with os/cell-root/build.sh; directory, not an image)\n"
 "  --workdir DIR writable workspace (default ~/agent-work)\n"
@@ -1956,6 +1994,7 @@ int main(int argc, char **argv)
         {"overlay",     required_argument, 0, 'O'},
         {"io-rbps",     required_argument, 0, 1000},
         {"io-wbps",     required_argument, 0, 1001},
+        {"egress",      required_argument, 0, 1003},
         {"ask",         no_argument, &C.ask, 1},
         {"secure",      no_argument, &C.secure, 1},
         {"deny",        required_argument, 0, 'd'},
@@ -2012,6 +2051,18 @@ int main(int argc, char **argv)
         case 1002:
             if (!realpath(optarg, C.rootfs)) die(optarg);
             break;
+        case 1003: {
+            char *c = strrchr(optarg, ':');
+            if (!c || !c[1] || c == optarg) {
+                fprintf(stderr, "sand: --egress needs HOST:PORT\n");
+                return 2;
+            }
+            snprintf(C.egress_host, sizeof C.egress_host, "%.*s",
+                     (int)(c - optarg), optarg);
+            snprintf(C.egress_port, sizeof C.egress_port, "%s", c + 1);
+            C.netmode = NET_VETH;    /* egress filtering rides on veth */
+            break;
+        }
         case 'd':
             if (C.n_deny < MAXBIND) {
                 snprintf(C.deny[C.n_deny], 256, "%s", optarg);
