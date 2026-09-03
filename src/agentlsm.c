@@ -48,6 +48,9 @@
 #include <errno.h>
 #include <netdb.h>
 #include <stdarg.h>
+#include "arch/syscalls.h"   /* AC_* syscall table */
+
+static const struct ac_sys ac_syscalls[] = { AC_SYSCALL_TAB };
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -87,32 +90,10 @@ struct evt {
 
 static const char *attempt_name(unsigned nr)
 {
-    switch (nr) {
-    case 165: return "mount";
-    case 166: return "umount2";
-    case 155: return "pivot_root";
-    case 272: return "unshare";
-    case 308: return "setns";
-    case 435: return "clone3";
-    case 321: return "bpf";
-    case 298: return "perf_event_open";
-    case 101: return "ptrace";
-    case 250: return "keyctl";
-    case 175: return "init_module";
-    case 176: return "delete_module";
-    case 323: return "userfaultfd";
-    case 425: return "io_uring_setup";
-    case 430: return "fsopen";          /* new mount API */
-    case 431: return "fsconfig";
-    case 432: return "fsmount";
-    case 433: return "fspick";
-    case 429: return "move_mount";
-    case 428: return "open_tree";
-    case 442: return "mount_setattr";
-    case 202: return "ioperm";
-    case 110: return "iopl";
-    default:  return "?";
-    }
+    for (size_t i = 0; i < sizeof ac_syscalls / sizeof ac_syscalls[0]; i++)
+        if ((unsigned)ac_syscalls[i].nr == nr)
+            return ac_syscalls[i].name;
+    return "?";
 }
 
 /* ---- shared bpf state ------------------------------------------------ */

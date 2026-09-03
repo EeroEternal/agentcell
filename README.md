@@ -412,9 +412,11 @@ and a 1G tmpfs scratch.
 
 ## Notes & limits
 
-- x86_64 only — Intel and AMD alike (the syscall ABI is per-architecture,
-  not per-vendor; numbers are hardcoded in the seccomp filter & probes).
-  ARM64 would need its own syscall table + `AUDIT_ARCH_AARCH64`.
+- x86_64 **and aarch64**. Syscall numbers come from generated per-arch
+  tables (`src/arch/`, regen with `make arch` from kernel uapi headers)
+  and are cross-checked against glibc `SYS_*` in the suite. On aarch64
+  the absent syscalls (ioperm/iopl, vm86, …) are dropped automatically;
+  BPF probes need vmlinux.h from an arm64 host (`make src/vmlinux.h`).
 - `/etc` is bound read-only and therefore readable (incl. `/etc/shadow` —
   host root can read it anyway; swap to a curated copy if that matters).
 - seccomp returns **EPERM** (agent-visible). Switch the deny tail to

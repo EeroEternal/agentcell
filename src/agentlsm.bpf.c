@@ -16,6 +16,8 @@
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
+#include "arch/syscalls.h"   /* AC_SYS_*: per-arch numbers (BPF build
+                              * selects via -D__TARGET_ARCH_*) */
 
 #ifndef EPERM
 #define EPERM 1
@@ -175,18 +177,9 @@ struct tp_sys_exit {
 static __always_inline int trip_nr(long nr)
 {
     switch (nr) {
-    case 165: case 166:              /* mount, umount2            */
-    case 155:                        /* pivot_root                */
-    case 272: case 308: case 435:    /* unshare, setns, clone3    */
-    case 321: case 298:              /* bpf, perf_event_open      */
-    case 101:                        /* ptrace                    */
-    case 250:                        /* keyctl                    */
-    case 175: case 176:              /* init/delete_module        */
-    case 323:                        /* userfaultfd               */
-    case 425:                        /* io_uring_setup            */
-    case 430: case 431: case 432:    /* fsopen, fsconfig, fsmount */
-    case 433: case 429: case 428:    /* fspick, move_mount, open_tree */
-    case 442:                        /* mount_setattr             */
+#define X(s) case AC_SYS_##s:
+    AC_TRIP_X
+#undef X
         return 1;
     }
     return 0;

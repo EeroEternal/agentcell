@@ -16,6 +16,8 @@
  */
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
+#include "arch/syscalls.h"   /* AC_SYS_*: per-arch numbers (BPF build
+                              * selects via -D__TARGET_ARCH_*) */
 
 #define DLEN 192
 
@@ -84,7 +86,7 @@ static __always_inline struct ev *reserve(__u32 type, __u32 nr)
 SEC("tracepoint/syscalls/sys_enter_execve")
 int tp_execve(struct tp_sys_enter *ctx)
 {
-    struct ev *e = reserve(EV_EXEC, 59);
+    struct ev *e = reserve(EV_EXEC, AC_SYS_execve);
     if (!e) return 0;
     bpf_probe_read_user_str(e->data, DLEN, (const void *)ctx->args[0]);
     bpf_ringbuf_submit(e, 0);
@@ -95,7 +97,7 @@ int tp_execve(struct tp_sys_enter *ctx)
 SEC("tracepoint/syscalls/sys_enter_openat")
 int tp_openat(struct tp_sys_enter *ctx)
 {
-    struct ev *e = reserve(EV_OPEN, 257);
+    struct ev *e = reserve(EV_OPEN, AC_SYS_openat);
     if (!e) return 0;
     bpf_probe_read_user_str(e->data, DLEN, (const void *)ctx->args[1]);
     bpf_ringbuf_submit(e, 0);
@@ -106,40 +108,37 @@ int tp_openat(struct tp_sys_enter *ctx)
 SEC("tracepoint/syscalls/sys_enter_connect")
 int tp_connect(struct tp_sys_enter *ctx)
 {
-    struct ev *e = reserve(EV_CONNECT, 42);
+    struct ev *e = reserve(EV_CONNECT, AC_SYS_connect);
     if (!e) return 0;
     bpf_probe_read_user(e->data, 16, (const void *)ctx->args[1]);
     bpf_ringbuf_submit(e, 0);
     return 0;
 }
 
-/*
- * Escape-attempt probes — syscalls the sandbox denies anyway, but you
- * want to KNOW about. x86_64 syscall numbers passed explicitly.
- */
-#define ATTEMPT(name, nr)                                                  \
-SEC("tracepoint/syscalls/sys_enter_" #name)                                \
-int tp_att_##name(struct tp_sys_enter *ctx)                                \
-{                                                                          \
-    struct ev *e = reserve(EV_ATTEMPT, (nr));                              \
-    if (!e) return 0;                                                      \
-    bpf_ringbuf_submit(e, 0);                                              \
-    return 0;                                                              \
+/* TRIP probes — syscalls the sandbox denies anyway, but you want to
+ * KNOW about.  The per-arch list comes from src/arch headers (AC_TRIP_X);
+ * util-linux's tracepoint kept the historic name "umount" for
+ * umount2(2) — alias it. */
+#define AC_CAT3(a, b) a##b
+#define AC_CAT(a, b) AC_CAT3(a, b)
+#define AC_TP_umount2 umount
+#define TPNAME(s) AC_CAT(AC_TP_, s)
+#define AC_STR2(x) #x
+#define AC_STR(x) AC_STR2(x)
+
+#define ATTEMPT(name)                                                     \
+SEC("tracepoint/syscalls/sys_enter_" AC_STR(TPNAME(name)))                \
+int tp_att_##name(struct tp_sys_enter *ctx)                               \
+{                                                                         \
+    struct ev *e = reserve(EV_ATTEMPT, AC_SYS_##name);                    \
+    if (!e) return 0;                                                     \
+    bpf_ringbuf_submit(e, 0);                                             \
+    return 0;                                                             \
 }
 
-ATTEMPT(mount,         165)
-ATTEMPT(umount,       166)   /* tracepoint keeps the historic name */
-ATTEMPT(pivot_root,    155)
-ATTEMPT(unshare,       272)
-ATTEMPT(setns,         308)
-ATTEMPT(clone3,        435)
-ATTEMPT(bpf,           321)
-ATTEMPT(perf_event_open, 298)
-ATTEMPT(ptrace,        101)
-ATTEMPT(keyctl,        250)
-ATTEMPT(init_module,   175)
-ATTEMPT(delete_module, 176)
-ATTEMPT(userfaultfd,   323)
-ATTEMPT(io_uring_setup, 425)
+#define X(name) ATTEMPT(name)
+AC_TRIP_X
+#undef X
+#undef ATTEMPT
 
 char _license[] SEC("license") = "GPL";

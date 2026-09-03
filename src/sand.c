@@ -31,6 +31,8 @@
 #include <linux/filter.h>
 #include <linux/landlock.h>
 #include <linux/seccomp.h>
+
+#include "arch/syscalls.h"   /* AC_SYS_*: per-arch syscall numbers */
 #include <net/if.h>
 #include <net/route.h>
 #include <arpa/inet.h>
@@ -806,6 +808,9 @@ static void deny(long nr, const char *name)
 
 static void denylist_build(void);
 
+/* the generated deny-list / TRIP-naming table (src/arch headers) */
+static const struct ac_sys ac_syscalls[] = { AC_SYSCALL_TAB };
+
 static int cmp_sc(const void *a, const void *b)
 {
     long x = ((const struct sc_deny *)a)->nr;
@@ -867,7 +872,7 @@ static int seccomp_apply(void)
      */
     f_push((struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_ARCH));
     f_push((struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
-                                        AUDIT_ARCH_X86_64, 1, 0));
+                                        AC_AUDIT_ARCH, 1, 0));
     f_push((struct sock_filter)BPF_STMT(BPF_RET | BPF_K, DENY_KILL));
     f_push((struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_NR));
 
@@ -878,7 +883,7 @@ static int seccomp_apply(void)
      *   [k+3] EPERM
      *   [k+4] reload nr for the deny chain below
      */
-    f_push((struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone, 0, 4));
+    f_push((struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AC_SYS_clone, 0, 4));
     f_push((struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_ARG0));
     f_push((struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K,
                                         CLONE_NEWUSER | CLONE_NEWNET, 0, 1));
@@ -887,7 +892,8 @@ static int seccomp_apply(void)
 
     denylist_build();
     /* clone3: ENOSYS so libc falls back to clone(2), which is masked */
-    deny_enosys(SYS_clone3);
+    if (AC_SYS_clone3 >= 0)
+        deny_enosys(AC_SYS_clone3);
 
     /* deny-list -> sorted balanced BST: O(log n) per syscall */
     qsort(g_deny, g_ndeny, sizeof g_deny[0], cmp_sc);
@@ -910,49 +916,10 @@ static int seccomp_apply(void)
  * the filter) and in the parent under --ask (for sc_name display) */
 static void denylist_build(void)
 {
-    /* kernel / modules / debugging */
-    DENY(bpf);                DENY(perf_event_open);
-    DENY(init_module);        DENY(finit_module);
-    DENY(delete_module);      DENY(kexec_load);
-    DENY(kexec_file_load);    DENY(reboot);
-    DENY(swapon);             DENY(swapoff);
-#ifdef SYS_acpi
-    DENY(acpi);
-#endif
-    /* inspecting / injecting into other processes */
-    DENY(ptrace);             DENY(process_vm_readv);
-    DENY(process_vm_writev);  DENY(kcmp);
-    DENY(pidfd_getfd);        DENY(process_madvise);
-#ifdef SYS_process_mrelease
-    DENY(process_mrelease);
-#endif
-    /* namespace / mount escapes */
-    DENY(mount);              DENY(umount2);
-    DENY(pivot_root);         DENY(unshare);
-    DENY(setns);              DENY(open_by_handle_at);
-    DENY(name_to_handle_at);
-    DENY(fsopen);             DENY(fsconfig);
-    DENY(fsmount);            DENY(fspick);
-    DENY(move_mount);         DENY(open_tree);
-    DENY(mount_setattr);
-    /* keyring, time, io_uring and other sharp edges */
-    DENY(keyctl);             DENY(add_key);
-    DENY(request_key);        DENY(fanotify_init);
-    DENY(clock_settime);
-#ifdef SYS_clock_settime64
-    DENY(clock_settime64);
-#endif
-    DENY(settimeofday);       DENY(adjtimex);
-    DENY(vhangup);            DENY(syslog);
-    DENY(ioperm);             DENY(iopl);
-    DENY(quotactl);           DENY(quotactl_fd);
-    DENY(userfaultfd);        DENY(uselib);
-    DENY(lookup_dcookie);
-    DENY(io_uring_setup);     DENY(io_uring_enter);
-    DENY(io_uring_register);
-#ifdef SYS_vm86
-    DENY(vm86);               DENY(vm86old);
-#endif
+    /* generated per-arch table; syscalls absent on this arch (ioperm on
+     * arm64, vm86 on x86_64, ...) were already dropped by the generator */
+    for (size_t i = 0; i < sizeof ac_syscalls / sizeof ac_syscalls[0]; i++)
+        deny(ac_syscalls[i].nr, ac_syscalls[i].name);
 }
 
 /* ------------------------------------------------------------------ */

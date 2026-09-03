@@ -67,6 +67,9 @@ ffi-demo: libagentcell.a examples/ffi_demo.c
 ROOTFS ?= os/out/cell-root
 SIZE   ?= 4
 
+arch:
+	tools/gen-arch-headers.sh
+
 rootfs:
 	os/cell-root/build.sh --minimal $(ROOTFS)
 
@@ -85,4 +88,4 @@ fast: sand rootfs
 
 all: sand agentmon agentlsm
 
-.PHONY: all clean check lib ffi-demo rootfs rootfs-host pool pool-exec fast
+.PHONY: all clean check lib ffi-demo arch rootfs rootfs-host pool pool-exec fast

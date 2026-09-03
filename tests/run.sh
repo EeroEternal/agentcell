@@ -76,6 +76,32 @@ done
 t_out "sand --help mentions serve"   "serve"   ./sand --help
 t_out "sand --help mentions lsm"     "lsm"     ./sand --help
 
+section "arch tables"
+if cat > "$RT/acchk.c" <<'ACEOF'
+#include <stdio.h>
+#include <sys/syscall.h>
+#include "arch/syscalls.h"
+#define CHK(x) do { if (AC_SYS_##x >= 0 && AC_SYS_##x != SYS_##x) { \
+    printf("MISMATCH %s gen=%d libc=%ld\n", #x, AC_SYS_##x, (long)SYS_##x); \
+    bad++; } } while (0)
+int main(void) {
+    int bad = 0;
+    CHK(mount) CHK(umount2) CHK(pivot_root) CHK(unshare) CHK(setns)
+    CHK(bpf) CHK(ptrace) CHK(keyctl) CHK(reboot) CHK(fanotify_init)
+    CHK(clone) CHK(clone3) CHK(execve) CHK(openat) CHK(connect)
+    CHK(fsopen) CHK(move_mount) CHK(io_uring_setup) CHK(userfaultfd)
+    printf(bad ? "BAD\n" : "OK\n");
+    return bad;
+}
+ACEOF
+   cc -I src -o "$RT/acchk" "$RT/acchk.c" >>"$LOG" 2>&1 \
+   && "$RT/acchk" >>"$LOG" 2>&1 && grep -q OK <("$RT/acchk"); then
+    pass "generated table matches glibc SYS_*"
+else
+    fail "generated table matches glibc SYS_*"
+fi
+: > "$LOG"
+
 section "one-shot sandbox"
 t_out "run echo"          "hi"      ./sand -- /bin/echo hi
 t_out "pid namespace"     "^1$"     ./sand -- /bin/sh -c 'echo $$'
