@@ -1,0 +1,43 @@
+[package]
+name = "agentcell"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT"
+authors = ["lipi <lipicoder@qq.com>"]
+description = "Unprivileged Linux sandbox for AI agents — namespaces, Landlock, seccomp, cgroups"
+repository = "https://github.com/EeroEternal/agentcell"
+homepage = "https://github.com/EeroEternal/agentcell"
+documentation = "https://docs.rs/agentcell"
+readme = "rust/README.md"
+keywords = ["sandbox", "seccomp", "landlock", "namespace", "cgroup"]
+categories = ["os::linux-apis", "api-bindings"]
+links = "agentcell"
+include = [
+    "Cargo.toml",
+    "build.rs",
+    "LICENSE",
+    "rust/**",
+    "src/agentcell.h",
+    "src/libagentcell.c",
+    "src/sand.c",
+    "src/arch/*.h",
+]
+
+[lib]
+name = "agentcell"
+path = "rust/src/lib.rs"
+
+[[example]]
+name = "spawn"
+path = "rust/examples/spawn.rs"
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+cc = "1"
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+rustdoc-args = ["--cfg", "docsrs"]

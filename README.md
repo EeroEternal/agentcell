@@ -50,6 +50,14 @@ make          # -> sand (unprivileged) + agentmon + agentlsm (eBPF, root)
 make check    # regression suite
 ```
 
+Rust hosts (Linux): the [`agentcell`](https://crates.io/crates/agentcell) crate
+wraps `libagentcell` and publishes the same ABI to crates.io.
+
+```toml
+[dependencies]
+agentcell = "0.1"
+```
+
 ## Usage
 
 Fast path on Arch (packed rootfs + pre-warmed cells — no `clone` per command):
@@ -334,7 +342,8 @@ make lib ffi-demo && ./ffi-demo   # hi-from-ffi, id -u = 0, exit 7
 
 `make lib` builds `libagentcell.a` (unity build of sand.c; `die()`
 longjmps instead of exiting). Not thread-safe — serialize spawns.
-Rust hosts bind the same ABI with a small `agentcell-sys` crate.
+Rust hosts: the [`agentcell`](https://crates.io/crates/agentcell) crate on
+crates.io wraps the same ABI (`agentcell::ffi` for the raw C functions).
 
 ## Fine-grained egress (`--egress`)
 

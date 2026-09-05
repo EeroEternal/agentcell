@@ -43,3 +43,15 @@ jobs:
         with:
           name: check-log
           path: check.log
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: allow unprivileged user namespaces
+        run: sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: cargo test
+        run: cargo test
+      - name: cargo package
+        run: cargo package --allow-dirty --no-verify

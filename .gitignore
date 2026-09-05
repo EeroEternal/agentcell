@@ -10,3 +10,4 @@ os/out/
 ffi-demo
 libagentcell.a
 libagentcell.o
+/target
