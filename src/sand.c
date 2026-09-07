@@ -375,16 +375,21 @@ static void cgroup_setup(void)
     fclose(f);
     if (!self[0]) return;
 
-    /* systemd session scopes are leaf cgroups — children are only allowed
-     * under the delegated user@UID.service root. Cut the path there.     */
+    /* systemd session scopes and DelegateSubgroup= leaves are not writable
+     * for subtree_control (no-internal-process). Cut back to the delegated
+     * unit: user@UID.service or any *.service. */
     snprintf(base, sizeof base, "/sys/fs/cgroup%s", self);
-    char *svc = strstr(base, "/user@");
+    char *svc = strstr(base, ".service");
     if (svc) {
-        char *slash = strchr(svc + 1, '/');
-        if (slash) {
-            /* keep app-XXX.slice prefixes? no: go straight under the service */
-            *slash = 0;
-            /* re-extend: base now ends at user@1000.service */
+        char *after = svc + strlen(".service");
+        if (*after == '/')
+            *after = 0;
+    } else {
+        char *usr = strstr(base, "/user@");
+        if (usr) {
+            char *slash = strchr(usr + 1, '/');
+            if (slash)
+                *slash = 0;
         }
     }
 
