@@ -52,6 +52,21 @@ $(LSMHDR): $(LSMOBJ)
 src/vmlinux.h:
 	bpftool btf dump file /sys/kernel/btf/vmlinux format c > src/vmlinux.h
 
+PREFIX  ?= /usr/local
+DESTDIR ?=
+
+install: sand
+	install -d $(DESTDIR)$(PREFIX)/bin
+	install -m 0755 sand $(DESTDIR)$(PREFIX)/bin/sand
+
+install-apparmor:
+	install -d $(DESTDIR)/etc/apparmor.d
+	install -m 0644 packaging/apparmor/usr.bin.sand \
+	    $(DESTDIR)/etc/apparmor.d/usr.bin.sand
+	@if [ -z "$(DESTDIR)" ] && command -v apparmor_parser >/dev/null 2>&1; then \
+	  apparmor_parser -r /etc/apparmor.d/usr.bin.sand; \
+	fi
+
 check: all
 	tests/run.sh
 
@@ -88,4 +103,4 @@ fast: sand rootfs
 
 all: sand agentmon agentlsm
 
-.PHONY: all clean check lib ffi-demo arch rootfs rootfs-host pool pool-exec fast
+.PHONY: all clean check lib ffi-demo arch rootfs rootfs-host pool pool-exec fast install install-apparmor

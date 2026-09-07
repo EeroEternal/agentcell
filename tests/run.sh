@@ -211,6 +211,19 @@ for _ in $(seq 50); do
 done
 if [ -n "${SOCK:-}" ] && [ -S "$SOCK" ]; then pass "serve socket"
 else fail "serve socket"; fi
+if grep -q "^AGENTCELL_SOCK=" "$RT/serve.out"; then pass "serve prints AGENTCELL_SOCK"
+else fail "serve prints AGENTCELL_SOCK"; fi
+
+CUSTOM="$RT/custom.sock"
+./sand serve --sock "$CUSTOM" --timeout 30 >"$RT/serve-sock.out" 2>&1 &
+CELL_SOCK_PID=$!
+if wait_sock "$CUSTOM" && grep -q "AGENTCELL_SOCK=$CUSTOM" "$RT/serve-sock.out"; then
+    pass "serve --sock PATH"
+else
+    fail "serve --sock PATH"
+fi
+kill "$CELL_SOCK_PID" 2>/dev/null || true
+wait "$CELL_SOCK_PID" 2>/dev/null || true
 t_out "cells lists the cell" "agentcell-" ./sand cells
 t_out "exec echo"      "hello"   ./sand exec "$SOCK" -- /bin/echo hello
 t_out "exec stdin"     "piped"   sh -c "printf piped | ./sand exec $SOCK -- cat"

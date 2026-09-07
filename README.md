@@ -48,7 +48,13 @@ Requires: `clang` (for eBPF), `libbpf`, `libelf`, `zlib`, `xxd` (vim-common).
 ```bash
 make          # -> sand (unprivileged) + agentmon + agentlsm (eBPF, root)
 make check    # regression suite
+sudo make install              # /usr/local/bin/sand
+sudo make install-apparmor     # Ubuntu 24.04: allow unprivileged userns
 ```
+
+`sand` itself needs only a C compiler. `install-apparmor` is required on Ubuntu
+24.04+ (`kernel.apparmor_restrict_unprivileged_userns=1`); without it, `sand`
+fails at `make mounts private`. Do not sysctl that knob to 0 on a shared host.
 
 Rust hosts (Linux): the [`agentcell`](https://crates.io/crates/agentcell) crate
 wraps `libagentcell` and publishes the same ABI to crates.io.
@@ -103,6 +109,15 @@ Pre-warm cells so each command skips `clone` (same isolation, serve protocol):
 python3 os/agentcelld/pool.py --size 4
 python3 os/agentcelld/pool.py exec -- echo hi
 python3 examples/client.py          # batch / streaming / interactive agent
+```
+
+Hosts that pick the socket path (e.g. Cloudcell) should pass `--sock`:
+
+```bash
+sand serve --sock /var/lib/cloudcell/sbx/<id>/cell.sock \
+           --workdir /var/lib/cloudcell/sbx/<id>/work \
+           --mem 1G --cpu 1 --pids 64 --net none
+# stderr includes: AGENTCELL_SOCK=/var/lib/cloudcell/sbx/<id>/cell.sock
 ```
 
 ## Real networking (`--net veth`)

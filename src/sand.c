@@ -162,6 +162,7 @@ struct cfg {
     char veth_if[64], veth_ip[64], veth_gw[64];   /* --net veth */
     char workdir[PATH_MAX];
     char rootfs[PATH_MAX];          /* --rootfs DIR; empty = host /usr /etc */
+    char sock[PATH_MAX];            /* --sock PATH for serve; empty = auto */
     char *ro[MAXBIND]; int n_ro;
     char *rw[MAXBIND]; int n_rw;
     struct bind { char src[PATH_MAX]; char dst[PATH_MAX]; int ro; }
@@ -186,6 +187,7 @@ static struct cfg C = {
     .netmode  = NET_NONE,
     .workdir   = "",
     .rootfs    = "",
+    .sock      = "",
 };
 
 static uid_t g_uid;
@@ -1257,10 +1259,14 @@ static void serve_loop(pid_t jail)
 
     int lfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     struct sockaddr_un a = { .sun_family = AF_UNIX };
-    const char *rt = getenv("XDG_RUNTIME_DIR");
-    if (!rt) rt = "/tmp";
-    snprintf(g_sock_path, sizeof g_sock_path, "%s/agentcell-%d.sock", rt,
-             (int)jail);
+    if (C.sock[0]) {
+        snprintf(g_sock_path, sizeof g_sock_path, "%s", C.sock);
+    } else {
+        const char *rt = getenv("XDG_RUNTIME_DIR");
+        if (!rt) rt = "/tmp";
+        snprintf(g_sock_path, sizeof g_sock_path, "%s/agentcell-%d.sock", rt,
+                 (int)jail);
+    }
     unlink(g_sock_path);
     snprintf(a.sun_path, sizeof a.sun_path, "%s", g_sock_path);
     socklen_t alen = offsetof(struct sockaddr_un, sun_path) +
@@ -1273,6 +1279,7 @@ static void serve_loop(pid_t jail)
     snprintf(g_info_path, sizeof g_info_path, "%s.info", g_sock_path);
     write_info(jail);
 
+    fprintf(stderr, "AGENTCELL_SOCK=%s\n", g_sock_path);
     fprintf(stderr, "sand: serving %s  (jail pid %d, Ctrl-C to stop)\n",
             g_sock_path, jail);
 
@@ -1904,7 +1911,8 @@ static void usage(FILE *out)
 "                (y=allow once, n=deny, a=always, k=kill; one-shot only)\n"
 "\n"
 "long-running mode (isolation set up once, then reused):\n"
-"  sand serve [options]       start a jailed exec server, prints SOCK\n"
+"  --sock PATH  serve: listen on PATH instead of XDG_RUNTIME_DIR/agentcell-<pid>.sock\n"
+"  sand serve [options]       start a jailed exec server; prints AGENTCELL_SOCK=\n"
 "  sand exec SOCK [--] CMD..  run CMD inside that jail\n"
 "  sand cells | sand top      list running cells / live view\n"
 "  sand lsm [-f [classes]]    LSM policies; -f: live event stream from\n"
@@ -1951,6 +1959,7 @@ int main(int argc, char **argv)
         {"pids",        required_argument, 0, 'P'},
         {"net",         required_argument, 0, 'n'},
         {"rootfs",      required_argument, 0, 1002},
+        {"sock",        required_argument, 0, 1004},
         {"workdir",     required_argument, 0, 'w'},
         {"ro",          required_argument, 0, 'r'},
         {"rw",          required_argument, 0, 'W'},
@@ -2017,6 +2026,15 @@ int main(int argc, char **argv)
         case 1001: C.io_wbps = parse_mem(optarg); break;
         case 1002:
             if (!realpath(optarg, C.rootfs)) die(optarg);
+            break;
+        case 1004:
+            if (optarg[0] == '/') {
+                snprintf(C.sock, sizeof C.sock, "%s", optarg);
+            } else {
+                char cwd[PATH_MAX];
+                if (!getcwd(cwd, sizeof cwd)) die("getcwd");
+                snprintf(C.sock, sizeof C.sock, "%s/%s", cwd, optarg);
+            }
             break;
         case 1003: {
             char *c = strrchr(optarg, ':');
