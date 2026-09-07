@@ -703,8 +703,22 @@ static void landlock_apply(void)
     if (abi >= 3) { rw |= LANDLOCK_ACCESS_FS_TRUNCATE;   handled |= LANDLOCK_ACCESS_FS_TRUNCATE; }
     if (abi >= 5) { rw |= LANDLOCK_ACCESS_FS_IOCTL_DEV;  handled |= LANDLOCK_ACCESS_FS_IOCTL_DEV; }
 
+    /* Newer libc headers grew landlock_ruleset_attr (net/scoped). A
+     * sizeof that the running kernel rejects comes back as EINVAL. */
     struct landlock_ruleset_attr attr = { .handled_access_fs = handled };
-    int fd = syscall(SYS_landlock_create_ruleset, &attr, sizeof attr, 0);
+    int fd = -1;
+    const size_t try_sz[] = { 8, 16, 24, sizeof attr };
+    for (unsigned i = 0; i < sizeof try_sz / sizeof try_sz[0] && fd < 0; i++)
+        fd = (int)syscall(SYS_landlock_create_ruleset, &attr, try_sz[i], 0);
+    if (fd < 0) {
+        handled = LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE |
+                  LANDLOCK_ACCESS_FS_READ_DIR | LANDLOCK_ACCESS_FS_WRITE_FILE |
+                  LANDLOCK_ACCESS_FS_REMOVE_DIR | LANDLOCK_ACCESS_FS_REMOVE_FILE |
+                  LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_MAKE_DIR;
+        rw = handled;
+        attr.handled_access_fs = handled;
+        fd = (int)syscall(SYS_landlock_create_ruleset, &attr, 8, 0);
+    }
     if (fd < 0) { warn2("landlock_create_ruleset"); return; }
 
     /* read-only OS view (the / rule makes the root listable; writes are

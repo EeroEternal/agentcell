@@ -283,6 +283,8 @@ static void nat_ensure(void)
        " || iptables -I FORWARD -s 10.200.0.0/16 -j ACCEPT");
     sh("iptables -C FORWARD -d 10.200.0.0/16 -j ACCEPT 2>/dev/null"
        " || iptables -I FORWARD -d 10.200.0.0/16 -j ACCEPT");
+    sh("iptables -C FORWARD -s 10.200.0.0/16 -d 169.254.0.0/16 -j DROP 2>/dev/null"
+       " || iptables -I FORWARD -s 10.200.0.0/16 -d 169.254.0.0/16 -j DROP");
     g_nat_on = 1;
 }
 
@@ -293,6 +295,7 @@ static void nat_teardown(void)
     sh("iptables -t nat -D POSTROUTING -s 10.200.0.0/16 -j MASQUERADE 2>/dev/null");
     sh("iptables -D FORWARD -s 10.200.0.0/16 -j ACCEPT 2>/dev/null");
     sh("iptables -D FORWARD -d 10.200.0.0/16 -j ACCEPT 2>/dev/null");
+    sh("iptables -D FORWARD -s 10.200.0.0/16 -d 169.254.0.0/16 -j DROP 2>/dev/null");
     if (g_fwd_save >= 0) {
         FILE *f = fopen("/proc/sys/net/ipv4/ip_forward", "w");
         if (f) { fprintf(f, "%d\n", g_fwd_save); fclose(f); }
