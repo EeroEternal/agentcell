@@ -121,11 +121,12 @@ int agentcell_spawn(const struct agentcell_config *cfg,
         if (stat(C.rootfs, &st) < 0 || !S_ISDIR(st.st_mode)) die("rootfs");
     }
     if (cfg->egress) {
-        const char *c = strrchr(cfg->egress, ':');
-        if (!c || !c[1] || c == cfg->egress) die("--egress HOST:PORT");
-        snprintf(C.egress_host, sizeof C.egress_host, "%.*s",
-                 (int)(c - cfg->egress), cfg->egress);
-        snprintf(C.egress_port, sizeof C.egress_port, "%s", c + 1);
+        if (egress_add(cfg->egress)) die("--egress HOST[:PORT]");
+        C.netmode = NET_VETH;
+    }
+    if (cfg->egress_list) {
+        for (const char *const *e = cfg->egress_list; *e; e++)
+            if (egress_add(*e)) die("--egress HOST[:PORT]");
         C.netmode = NET_VETH;
     }
 

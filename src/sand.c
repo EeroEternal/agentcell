@@ -58,6 +58,11 @@
 #include <unistd.h>
 
 #define MAXBIND 32
+#define MAX_EGRESS 16
+#define MAX_ENV 64
+#define MAX_SECRET 8
+
+static int write_full(int fd, const void *buf, size_t n);
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -175,7 +180,15 @@ struct cfg {
     int  n_deny;
     char *ov[MAXBIND]; int n_ov;      /* --overlay DIR: copy-on-write binds */
     long io_rbps, io_wbps;          /* io.max on the workspace device (0=off) */
-    char egress_host[128], egress_port[8];  /* --egress HOST:PORT (veth only) */
+    char egress_host[MAX_EGRESS][128];  /* --egress HOST[:PORT] allowlist */
+    char egress_port[MAX_EGRESS][8];
+    int  n_egress;
+    char *env[MAX_ENV]; int n_env;    /* --env / --env-file K=V */
+    char secret_dst[MAX_SECRET][PATH_MAX];  /* --secret DST=SRC on tmpfs */
+    char *secret_data[MAX_SECRET];
+    size_t secret_len[MAX_SECRET];
+    int  n_secrets;
+    long workdir_size;                /* --workdir-size: tmpfs workspace */
     int  timeout;
     char *const *argv;
 };
@@ -510,7 +523,15 @@ static void do_mounts(void)
 
     /* the agent's writable workspace */
     NR("/home/agent"); mmkdir_p(p, 0755);
-    bind_mount(C.workdir, p, 0, 0);
+    if (C.workdir_size > 0) {
+        /* hard size cap without root: a RAM-backed workspace.  Counts
+         * against the cell's memory.max, so size it with --mem */
+        char opts[64];
+        snprintf(opts, sizeof opts, "size=%ld,mode=0755", C.workdir_size);
+        tmpfs_mount(p, opts);
+    } else {
+        bind_mount(C.workdir, p, 0, 0);
+    }
 
     /* extra binds land under /mnt/<basename> */
     NR("/mnt"); mmkdir(p, 0755);
@@ -561,6 +582,20 @@ static void do_mounts(void)
 
     NR("/var/tmp"); mmkdir_p(p, 01777); tmpfs_mount(p, "size=128m,mode=1777");
     NR("/run");     mmkdir(p, 0755);   tmpfs_mount(p, "size=64m,mode=755");
+
+    /* --secret DST=SRC: drop 0600 copies on the cell's tmpfs so tokens
+     * and keys never touch the host disk.  do_mounts() runs before
+     * pivot_root, so DST is resolved inside the new root. */
+    for (int i = 0; i < C.n_secrets; i++) {
+        char full[PATH_MAX];
+        snprintf(full, sizeof full, "%s%s", g_newroot, C.secret_dst[i]);
+        char *slash = strrchr(full, '/');
+        if (slash) { *slash = 0; mmkdir_p(full, 0700); *slash = '/'; }
+        int sfd = open(full, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+        if (sfd < 0 || write_full(sfd, C.secret_data[i], C.secret_len[i]) < 0)
+            warn2("secret");
+        if (sfd >= 0) close(sfd);
+    }
     /* with host networking, systemd-resolved lives behind /run/systemd —
      * bind it ro so /etc/resolv.conf's symlink and the resolver socket work */
     if (C.netmode == NET_HOST) {
@@ -1468,7 +1503,7 @@ static int lsm_cmd(const char *cmd, char *rep, size_t repn)
 {
     int s = lsm_connect();
     if (s < 0) return -1;
-    char line[320], scratch[64];
+    char line[1024], scratch[64];
     snprintf(line, sizeof line, "%s\n", cmd);
     if (write_full(s, line, strlen(line)) < 0) { close(s); return -1; }
     if (!rep) { rep = scratch; repn = sizeof scratch; }
@@ -1525,17 +1560,108 @@ static void lsm_unregister(void)
     lsm_cmd(cmd, NULL, 0);
 }
 
+/* --egress HOST[:PORT]: append to the veth allowlist.  Port defaults
+ * to 443 when omitted.  Returns 0 on success. */
+static int egress_add(const char *spec)
+{
+    if (C.n_egress >= MAX_EGRESS) return -1;
+    const char *port = "443";
+    size_t hl = strlen(spec);
+    const char *c = strrchr(spec, ':');
+    if (c && c[1] && strspn(c + 1, "0123456789") == strlen(c + 1)) {
+        port = c + 1;
+        hl = (size_t)(c - spec);
+    }
+    if (hl == 0 || hl >= sizeof C.egress_host[0]) return -1;
+    snprintf(C.egress_host[C.n_egress], sizeof C.egress_host[0],
+             "%.*s", (int)hl, spec);
+    snprintf(C.egress_port[C.n_egress], sizeof C.egress_port[0],
+             "%s", port);
+    C.n_egress++;
+    C.netmode = NET_VETH;    /* egress filtering rides on veth */
+    return 0;
+}
+
+/* Read a whole regular file into a NUL-terminated malloc buffer. */
+static char *slurp(const char *path, size_t *out_len)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) { close(fd); return NULL; }
+    size_t n = (size_t)st.st_size, off = 0;
+    char *buf = malloc(n + 1);
+    if (!buf) { close(fd); return NULL; }
+    while (off < n) {
+        ssize_t r = read(fd, buf + off, n - off);
+        if (r <= 0) break;
+        off += (size_t)r;
+    }
+    close(fd);
+    buf[off] = 0;
+    if (out_len) *out_len = off;
+    return buf;
+}
+
+static void env_add(const char *kv)
+{
+    if (C.n_env >= MAX_ENV || !strchr(kv, '=')) return;
+    C.env[C.n_env++] = strdup(kv);
+}
+
+static int env_file_load(const char *path)
+{
+    char *buf = slurp(path, NULL);
+    if (!buf) return -1;
+    char *save = NULL;
+    for (char *line = strtok_r(buf, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
+        size_t l = strlen(line);
+        while (l && (line[l - 1] == '\r' || line[l - 1] == ' '))
+            line[--l] = 0;
+        while (*line == ' ') line++;
+        if (!*line || *line == '#') continue;
+        env_add(line);
+    }
+    free(buf);
+    return 0;
+}
+
+/* --secret DST=SRC: SRC must be a host file, DST an in-cell tmpfs path. */
+static int secret_add(const char *spec)
+{
+    if (C.n_secrets >= MAX_SECRET) return -1;
+    const char *eq = strchr(spec, '=');
+    if (!eq || eq == spec) return -1;
+    size_t dl = (size_t)(eq - spec);
+    if (dl >= sizeof C.secret_dst[0]) return -1;
+    char dst[PATH_MAX];
+    memcpy(dst, spec, dl);
+    dst[dl] = 0;
+    if (strncmp(dst, "/tmp/", 5) && strncmp(dst, "/run/", 5) &&
+        strncmp(dst, "/var/tmp/", 9))
+        return -1;               /* only tmpfs destinations are allowed */
+    size_t len = 0;
+    char *data = slurp(eq + 1, &len);
+    if (!data) return -1;
+    snprintf(C.secret_dst[C.n_secrets], sizeof C.secret_dst[0], "%s", dst);
+    C.secret_data[C.n_secrets] = data;
+    C.secret_len[C.n_secrets] = len;
+    C.n_secrets++;
+    return 0;
+}
+
 /* --net veth: the daemon (root) builds the pair + NAT; we configure
  * our end ourselves once it lands in the cell's netns.  The reply
  * rides the sync pipe: plain "x" means fallback to no network. */
 static int net_veth_register(pid_t child)
 {
-    char cmd[256], rep[128];
-    if (C.egress_host[0])
-        snprintf(cmd, sizeof cmd, "NETUP %d EGRESS %s %s",
-                 (int)child, C.egress_host, C.egress_port);
-    else
-        snprintf(cmd, sizeof cmd, "NETUP %d", (int)child);
+    char cmd[1024], rep[128];
+    int off = snprintf(cmd, sizeof cmd, "NETUP %d", (int)child);
+    for (int i = 0; i < C.n_egress && off > 0 && off < (int)sizeof cmd; i++)
+        off += snprintf(cmd + off, sizeof cmd - (size_t)off,
+                        " EGRESS %s %s",
+                        C.egress_host[i], C.egress_port[i]);
     if (lsm_cmd(cmd, rep, sizeof rep) < 0 || strncmp(rep, "OK ", 3) ||
         sscanf(rep + 3, "%63s %63s %63s",
                C.veth_if, C.veth_ip, C.veth_gw) != 3) {
@@ -1824,13 +1950,22 @@ static int child_main(void *arg)
         setenv("LANG",   "C.UTF-8", 1);
         setenv("TERM",   "xterm-256color", 1);
     }
-    if (C.egress_host[0]) {
+    if (C.n_egress == 1) {
         char p[192];
-        snprintf(p, sizeof p, "http://%s:%s", C.egress_host, C.egress_port);
+        snprintf(p, sizeof p, "http://%s:%s",
+                 C.egress_host[0], C.egress_port[0]);
         setenv("http_proxy",  p, 1);
         setenv("https_proxy", p, 1);
         setenv("all_proxy",   p, 1);
         setenv("no_proxy", "localhost,127.0.0.1", 1);
+    }
+    /* --env / --env-file override the defaults and any spawn envp */
+    for (int i = 0; i < C.n_env; i++) {
+        char *eq = strchr(C.env[i], '=');
+        if (!eq) continue;
+        *eq = 0;
+        setenv(C.env[i], eq + 1, 1);
+        *eq = '=';
     }
 
     if (g_spawn_fds[0] >= 0) {      /* FFI spawn: caller's stdio */
@@ -1905,9 +2040,17 @@ static void usage(FILE *out)
 "  --pids N      pids.max    (default 256)\n"
 "  --net MODE    none | host | veth (default none — loopback only;\n"
 "                veth = real networking with NAT, needs agentlsm daemon)\n"
-"  --egress H:P  outbound allowlist via --net veth: DNS + H:P only,\n"
-"                everything else DROPped at the host firewall; proxy\n"
-"                env (http_proxy etc.) is set inside the cell\n"
+"  --egress H[:P] outbound allowlist via --net veth (repeatable): DNS\n"
+"                plus every H (all A records) and port P (default 443)\n"
+"                passes; everything else DROPped at the host firewall.\n"
+"                One entry also sets http_proxy/https_proxy inside the cell\n"
+"  --env K=V     set an env var in the cell (repeatable).  NOT for\n"
+"                secrets: argv is visible to other host users\n"
+"  --env-file F  load K=V lines from F (use a 0600 file) into the cell env\n"
+"  --secret DST=SRC  copy host file SRC into the cell at DST (0600), which\n"
+"                must be under /tmp, /run or /var/tmp — RAM only\n"
+"  --workdir-size SIZE  RAM-backed workspace (tmpfs) of SIZE instead of\n"
+"                the rw bind: a hard cap that cannot fill the node disk\n"
 "  --rootfs DIR  OS view from DIR instead of the host /usr /etc /opt\n"
 "                (pack with os/cell-root/build.sh; directory, not an image)\n"
 "  --workdir DIR writable workspace (default ~/agent-work)\n"
@@ -1990,6 +2133,10 @@ int main(int argc, char **argv)
         {"io-rbps",     required_argument, 0, 1000},
         {"io-wbps",     required_argument, 0, 1001},
         {"egress",      required_argument, 0, 1003},
+        {"env",         required_argument, 0, 1005},
+        {"env-file",    required_argument, 0, 1006},
+        {"secret",      required_argument, 0, 1007},
+        {"workdir-size",required_argument, 0, 1008},
         {"ask",         no_argument, &C.ask, 1},
         {"secure",      no_argument, &C.secure, 1},
         {"deny",        required_argument, 0, 'd'},
@@ -2055,18 +2202,25 @@ int main(int argc, char **argv)
                 snprintf(C.sock, sizeof C.sock, "%s/%s", cwd, optarg);
             }
             break;
-        case 1003: {
-            char *c = strrchr(optarg, ':');
-            if (!c || !c[1] || c == optarg) {
-                fprintf(stderr, "sand: --egress needs HOST:PORT\n");
+        case 1003:
+            if (egress_add(optarg)) {
+                fprintf(stderr, "sand: bad or too many --egress "
+                                "(want HOST[:PORT], max %d)\n", MAX_EGRESS);
                 return 2;
             }
-            snprintf(C.egress_host, sizeof C.egress_host, "%.*s",
-                     (int)(c - optarg), optarg);
-            snprintf(C.egress_port, sizeof C.egress_port, "%s", c + 1);
-            C.netmode = NET_VETH;    /* egress filtering rides on veth */
             break;
-        }
+        case 1005: env_add(optarg); break;
+        case 1006:
+            if (env_file_load(optarg)) die(optarg);
+            break;
+        case 1007:
+            if (secret_add(optarg)) {
+                fprintf(stderr, "sand: --secret wants DST=SRC with DST "
+                                "under /tmp, /run or /var/tmp\n");
+                return 2;
+            }
+            break;
+        case 1008: C.workdir_size = parse_mem(optarg); break;
         case 'd':
             if (C.n_deny < MAXBIND) {
                 snprintf(C.deny[C.n_deny], 256, "%s", optarg);

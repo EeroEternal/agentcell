@@ -33,12 +33,17 @@ struct agentcell_config {
     double      cpu_cores;      /* 0 = default quota */
     uint32_t    pids;           /* 0 = 256 */
     int         net;            /* AGENTCELL_NET_* */
-    const char *egress;         /* "host:port" — NET_VETH only: DNS +
+    const char *egress;         /* "host[:port]" — NET_VETH only: DNS +
                                  * this dst pass, all else DROPped; also
-                                 * sets http_proxy inside the jail */
+                                 * sets http_proxy inside the jail.
+                                 * port defaults to 443 */
     int         secure;         /* agentlsm enforcement (deny /etc/shadow) */
     int         no_landlock;    /* debug */
     int         no_seccomp;     /* debug */
+    const char *const *egress_list; /* NULL-terminated "host[:port]" list;
+                                 * NET_VETH only, repeatable alternative to
+                                 * `egress`.  Every A record of each host is
+                                 * whitelisted, not just the first. */
 };
 
 /*

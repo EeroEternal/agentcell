@@ -26,8 +26,11 @@
  *                              lines; classes: deny,exec,open,net,trip
  *                              (comma-separated, default all)
  *
- *       NETUP <pid>           build a veth pair + NAT for the cell whose
- *                              jail pid is <pid>; replies
+ *       NETUP <pid> [EGRESS H1 P1 [EGRESS H2 P2 ...]]
+ *                              build a veth pair + NAT for the cell whose
+ *                              jail pid is <pid>.  Each EGRESS pair adds
+ *                              one destination to the cell's allowlist and
+ *                              whitelists every A record of H.  Replies
  *                              "OK <ifname> <cell-ip> <gw-ip>"
  *       NETDOWN <pid>          tear it down (frees the /30)
  *
@@ -164,7 +167,7 @@ struct conn {
     int   fd;
     int   watcher;
     __u32 mask;                 /* event classes this watcher wants */
-    char  buf[256];
+    char  buf[2048];
     size_t len;
 };
 static struct conn g_conn[MAX_WATCH];
@@ -254,9 +257,16 @@ static int on_evt(void *ctx, void *data, size_t size)
  * makes sure NAT exists; NETDOWN tears it down.  Everything the daemon
  * touches (veth ends, iptables rules, ip_forward) is reversed on exit.
  */
+#define MAX_EGRESS 16                          /* --egress entries per cell */
+#define MAX_EG_IPS 128                         /* resolved A records kept  */
 static __u64 g_netmap[256];                    /* 16384 /30s, one bit each */
-static struct { pid_t pid; int idx;
-                char egip[64]; char egport[8]; } g_nets[64];
+static struct {
+    pid_t pid;
+    int   idx;
+    int   n_eg;                                /* installed accept rules */
+    char  egip[MAX_EG_IPS][64];
+    char  egport[MAX_EG_IPS][8];
+} g_nets[64];
 static int   g_nat_on;
 static int   g_fwd_save = -1;
 
@@ -302,24 +312,29 @@ static void nat_teardown(void)
     }
 }
 
-/* --egress H:P: per-cell outbound allowlist on the FORWARD chain —
- * DNS + the one proxy dst pass, everything else from that veth is
- * dropped.  Rules sit ABOVE the global 10.200/16 ACCEPTs (inserted
- * with -I in reverse order). */
-static void egress_rules(int idx, const char *ip, const char *port, int add)
+/* --egress allowlist on the FORWARD chain: DNS + the whitelisted
+ * destinations pass, everything else from that veth is dropped.
+ * Base rules sit above the global 10.200/16 ACCEPTs (inserted with
+ * -I in reverse order); each resolved address gets one ACCEPT. */
+static void egress_base(int idx, int add)
 {
     const char *op = add ? "-I FORWARD 1" : "-D FORWARD";
     sh("iptables %s FORWARD -i vethh%d -j DROP 2>/dev/null", op, idx);
     sh("iptables %s FORWARD -i vethh%d -m conntrack "
        "--ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null", op, idx);
-    sh("iptables %s FORWARD -i vethh%d -p tcp -d %s --dport %s "
-       "-j ACCEPT 2>/dev/null", op, idx, ip, port);
     sh("iptables %s FORWARD -i vethh%d -p udp --dport 53 "
        "-j ACCEPT 2>/dev/null", op, idx);
 }
 
+static void egress_accept(int idx, const char *ip, const char *port, int add)
+{
+    const char *op = add ? "-I FORWARD 1" : "-D FORWARD";
+    sh("iptables %s FORWARD -i vethh%d -p tcp -d %s --dport %s "
+       "-j ACCEPT 2>/dev/null", op, idx, ip, port);
+}
+
 static int net_up(pid_t pid, char *rep, size_t repn,
-                  const char *eg_host, const char *eg_port)
+                  char hosts[][128], char ports[][8], int n_eg)
 {
     int slot = -1;
     for (int i = 0; i < 64; i++)
@@ -354,25 +369,42 @@ static int net_up(pid_t pid, char *rep, size_t repn,
     nat_ensure();
     g_nets[slot].pid = pid;
     g_nets[slot].idx = idx;
-    g_nets[slot].egip[0] = g_nets[slot].egport[0] = 0;
-    if (eg_host && eg_port) {
-        /* resolve the proxy target once, on the host side */
-        struct addrinfo hints = { .ai_family = AF_INET }, *ai;
-        if (getaddrinfo(eg_host, NULL, &hints, &ai) || !ai) {
-            sh("ip link del vethh%d 2>/dev/null", idx);
-            goto fail;
-        }
-        struct sockaddr_in *sin = (void *)ai->ai_addr;
-        if (!inet_ntop(AF_INET, &sin->sin_addr,
-                       g_nets[slot].egip, sizeof g_nets[slot].egip)) {
+    g_nets[slot].n_eg = 0;
+    if (n_eg > 0) {
+        egress_base(idx, 1);
+        for (int h = 0; h < n_eg; h++) {
+            struct addrinfo hints = { .ai_family = AF_INET,
+                                      .ai_socktype = SOCK_STREAM }, *ai = NULL;
+            if (getaddrinfo(hosts[h], NULL, &hints, &ai) || !ai) {
+                fprintf(stderr, "agentlsm: egress: cannot resolve %s\n",
+                        hosts[h]);
+                continue;
+            }
+            for (struct addrinfo *p = ai; p; p = p->ai_next) {
+                char ip[64];
+                struct sockaddr_in *sin = (void *)p->ai_addr;
+                if (!inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof ip))
+                    continue;
+                int dup = 0;
+                for (int j = 0; j < g_nets[slot].n_eg; j++)
+                    if (!strcmp(g_nets[slot].egip[j], ip) &&
+                        !strcmp(g_nets[slot].egport[j], ports[h])) {
+                        dup = 1;
+                        break;
+                    }
+                if (dup || g_nets[slot].n_eg >= MAX_EG_IPS) continue;
+                int j = g_nets[slot].n_eg++;
+                snprintf(g_nets[slot].egip[j], sizeof g_nets[slot].egip[j],
+                         "%s", ip);
+                snprintf(g_nets[slot].egport[j], sizeof g_nets[slot].egport[j],
+                         "%s", ports[h]);
+                egress_accept(idx, ip, ports[h], 1);
+            }
             freeaddrinfo(ai);
-            sh("ip link del vethh%d 2>/dev/null", idx);
-            goto fail;
         }
-        freeaddrinfo(ai);
-        snprintf(g_nets[slot].egport, sizeof g_nets[slot].egport,
-                 "%s", eg_port);
-        egress_rules(idx, g_nets[slot].egip, g_nets[slot].egport, 1);
+        if (g_nets[slot].n_eg == 0)
+            fprintf(stderr, "agentlsm: egress: no addresses resolved "
+                            "for this cell\n");
     }
     snprintf(rep, repn, "OK vethc%d 10.200.%u.%u 10.200.%u.%u\n",
              idx, (b + 2) >> 8, (b + 2) & 255, (b + 1) >> 8, (b + 1) & 255);
@@ -386,12 +418,14 @@ static void net_down(pid_t pid)
 {
     for (int i = 0; i < 64; i++) {
         if (g_nets[i].pid != pid) continue;
-        if (g_nets[i].egip[0])
-            egress_rules(g_nets[i].idx, g_nets[i].egip, g_nets[i].egport, 0);
+        for (int j = 0; j < g_nets[i].n_eg; j++)
+            egress_accept(g_nets[i].idx, g_nets[i].egip[j],
+                          g_nets[i].egport[j], 0);
+        if (g_nets[i].n_eg) egress_base(g_nets[i].idx, 0);
         sh("ip link del vethh%d 2>/dev/null", g_nets[i].idx);
         g_netmap[g_nets[i].idx >> 6] &= ~(1ULL << (g_nets[i].idx & 63));
         g_nets[i].pid = 0;
-        g_nets[i].egip[0] = 0;
+        g_nets[i].n_eg = 0;
     }
 }
 
@@ -399,8 +433,14 @@ static void net_cleanup_all(void)
 {
     for (int i = 0; i < 64; i++)
         if (g_nets[i].pid) {
+            for (int j = 0; j < g_nets[i].n_eg; j++)
+                egress_accept(g_nets[i].idx, g_nets[i].egip[j],
+                              g_nets[i].egport[j], 0);
+            if (g_nets[i].n_eg) egress_base(g_nets[i].idx, 0);
             sh("ip link del vethh%d 2>/dev/null", g_nets[i].idx);
+            g_netmap[g_nets[i].idx >> 6] &= ~(1ULL << (g_nets[i].idx & 63));
             g_nets[i].pid = 0;
+            g_nets[i].n_eg = 0;
         }
     nat_teardown();
 }
@@ -494,12 +534,33 @@ static void serve_line(int ci, char *line)
         g_conn[ci].mask = mask ? mask : ~0u;
         snprintf(rep, sizeof rep, "OK\n");
     } else if (!strncmp(line, "NETUP ", 6)) {
-        long pid;
-        char eh[128] = "", ep[8] = "";
-        int n = sscanf(line + 6, "%ld EGRESS %127s %7s", &pid, eh, ep);
-        if (n >= 1 &&
-            !net_up((pid_t)pid, rep, sizeof rep,
-                    n == 3 ? eh : NULL, n == 3 ? ep : NULL))
+        char *p = line + 6, *end;
+        long pid = strtol(p, &end, 10);
+        char hosts[MAX_EGRESS][128], ports[MAX_EGRESS][8];
+        int n_eg = 0, ok = (end != p);
+        p = end;
+        while (*p == ' ') p++;
+        if (ok && !strncmp(p, "EGRESS", 6)) {
+            p += 6;
+            for (;;) {
+                while (*p == ' ') p++;
+                if (!*p || n_eg >= MAX_EGRESS) break;
+                char *tok = p;
+                while (*p && *p != ' ') p++;
+                char save = *p; *p = 0;
+                snprintf(hosts[n_eg], sizeof hosts[n_eg], "%s", tok);
+                *p = save;
+                while (*p == ' ') p++;
+                if (!*p) break;
+                tok = p;
+                while (*p && *p != ' ') p++;
+                save = *p; *p = 0;
+                snprintf(ports[n_eg], sizeof ports[n_eg], "%s", tok);
+                *p = save;
+                n_eg++;
+            }
+        }
+        if (ok && !net_up((pid_t)pid, rep, sizeof rep, hosts, ports, n_eg))
             ;                                   /* net_up filled rep */
         else
             snprintf(rep, sizeof rep, "ERR netup\n");

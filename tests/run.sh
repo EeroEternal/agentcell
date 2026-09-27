@@ -164,6 +164,24 @@ else
 fi
 rm -f "$HOME/.agentcell-ovl-src"
 
+section "env / secret / workdir-size"
+t_out "env: --env" "hello-env" \
+      ./sand --env E_TEST=hello-env -- sh -c 'echo "$E_TEST"'
+printf 'F_TEST=from-file\n' > "$RT/envfile"
+chmod 600 "$RT/envfile"
+t_out "env: --env-file" "from-file" \
+      ./sand --env-file "$RT/envfile" -- sh -c 'echo "$F_TEST"'
+printf 'secret-payload\n' > "$RT/sec"
+chmod 600 "$RT/sec"
+t_out "secret: tmpfs file" "secret-payload" \
+      ./sand --secret "/run/t/secret=$RT/sec" -- cat /run/t/secret
+t_out "secret: mode 0600" "^600$" \
+      ./sand --secret "/run/t/secret=$RT/sec" -- stat -c %a /run/t/secret
+t_no "secret: tmpfs-only enforced" \
+     ./sand --secret "/etc/secret=$RT/sec" -- true
+t_out "workdir-size: hard cap" "8.0M" \
+      ./sand --workdir-size 8M -- df -h /home/agent
+
 section "io.max"
 SELF=$(sed -n 's|^0::||p' /proc/self/cgroup)
 BASE=$(echo "$SELF" | sed 's|\(/user@[0-9]*\.service\).*|\1|')
