@@ -15,7 +15,7 @@ workspaces can depend on it; `spawn` returns `Error::Unsupported` there.
 
 ```toml
 [dependencies]
-agentcell = "0.1"
+agentcell = "0.2"
 ```
 
 ## Usage
@@ -48,7 +48,7 @@ fn main() -> agentcell::Result<()> {
 | `cpu_cores` | `cpu_cores` | host default quota |
 | `pids` | `pids` | 256 |
 | `net` | `net` | loopback only |
-| `egress` | `egress` | off (`HOST:PORT` allowlist) |
+| `egress` | `egress_list` | off (repeatable `HOST[:PORT]`, all A records) |
 | `secure` | `secure` | off (`agentlsm` extra denies) |
 
 Raw FFI is under `agentcell::ffi` (Linux) if you want to drive `libagentcell`
@@ -63,7 +63,8 @@ yourself.
   On Ubuntu 24.04 also `kernel.apparmor_restrict_unprivileged_userns=0` or the
   packaged AppArmor profile.
 - `agentlsm` (root, eBPF LSM) is optional and only required for `--secure` /
-  `--egress` / `Net::Veth`.
+  `--egress` / `Net::Veth`. `Config::egress` is repeatable; the port
+  defaults to 443.
 
 ## License
 

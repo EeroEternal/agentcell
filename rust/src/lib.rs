@@ -139,7 +139,7 @@ pub struct Config {
     cpu_cores: f64,
     pids: u32,
     net: Net,
-    egress: Option<String>,
+    egress: Vec<String>,
     secure: bool,
     no_landlock: bool,
     no_seccomp: bool,
@@ -158,7 +158,7 @@ impl Default for Config {
             cpu_cores: 0.0,
             pids: 0,
             net: Net::None,
-            egress: None,
+            egress: Vec::new(),
             secure: false,
             no_landlock: false,
             no_seccomp: false,
@@ -210,9 +210,11 @@ impl Config {
         self
     }
 
-    /// `HOST:PORT` allowlist. Implies [`Net::Veth`]. Needs `agentlsm`.
+    /// `HOST[:PORT]` allowlist entry (repeatable, `PORT` defaults to 443).
+    /// Every A record of the host is whitelisted. Implies [`Net::Veth`].
+    /// Needs `agentlsm`.
     pub fn egress(&mut self, host_port: impl Into<String>) -> &mut Self {
-        self.egress = Some(host_port.into());
+        self.egress.push(host_port.into());
         self
     }
 
@@ -605,14 +607,18 @@ mod linux_impl {
                 }
                 None => std::ptr::null(),
             };
-            let egress = match &self.egress {
-                Some(s) => {
-                    let c = CString::new(s.as_bytes())?;
-                    let ptr = c.as_ptr();
-                    keep.push(c);
-                    ptr
-                }
-                None => std::ptr::null(),
+            let mut egress_ptrs: Vec<*const libc::c_char> =
+                Vec::with_capacity(self.egress.len() + 1);
+            for s in &self.egress {
+                let c = CString::new(s.as_bytes())?;
+                egress_ptrs.push(c.as_ptr());
+                keep.push(c);
+            }
+            egress_ptrs.push(std::ptr::null());
+            let egress_list = if self.egress.is_empty() {
+                std::ptr::null()
+            } else {
+                egress_ptrs.as_ptr()
             };
 
             let net = match self.net {
@@ -628,10 +634,11 @@ mod linux_impl {
                 cpu_cores: self.cpu_cores,
                 pids: self.pids,
                 net,
-                egress,
+                egress: std::ptr::null(),
                 secure: self.secure as libc::c_int,
                 no_landlock: self.no_landlock as libc::c_int,
                 no_seccomp: self.no_seccomp as libc::c_int,
+                egress_list,
             };
 
             let stdin = prepare(&self.stdin, 0, false)?;

@@ -31,6 +31,7 @@ pub struct agentcell_config {
     pub secure: c_int,
     pub no_landlock: c_int,
     pub no_seccomp: c_int,
+    pub egress_list: *const *const c_char,
 }
 
 impl Default for agentcell_config {
@@ -46,6 +47,7 @@ impl Default for agentcell_config {
             secure: 0,
             no_landlock: 0,
             no_seccomp: 0,
+            egress_list: std::ptr::null(),
         }
     }
 }
