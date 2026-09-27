@@ -61,7 +61,7 @@ wraps `libagentcell` and publishes the same ABI to crates.io.
 
 ```toml
 [dependencies]
-agentcell = "0.1"
+agentcell = "0.2"
 ```
 
 ## Usage
@@ -362,21 +362,58 @@ crates.io wraps the same ABI (`agentcell::ffi` for the raw C functions).
 
 ## Fine-grained egress (`--egress`)
 
-Outbound allowlist for agents that need exactly one API endpoint:
+Outbound allowlist for agents that need a few API endpoints. Repeat the
+flag for each destination; the port defaults to 443 and **every A record**
+of each host is whitelisted (CDN registries rotate IPs, so a single
+resolved address is not enough):
 
 ```bash
 sudo ./agentlsm serve                       # once per boot
-./sand --egress api.openai.com:443 -- agent # implies --net veth
+./sand --egress api.openai.com:443 \
+       --egress static.crates.io \
+       --egress index.crates.io -- agent     # implies --net veth
 ```
 
-Inside the cell: `http_proxy`/`https_proxy` are set to the target.
-At the host firewall the daemon installs per-cell rules on the
-veth: **DNS (53) + the given dst pass, everything else DROPs**
-(rules removed with the cell). Proxy-aware clients use the env;
-proxy-oblivious traffic is dropped regardless.
+Inside the cell: with exactly one `--egress` entry,
+`http_proxy`/`https_proxy` are set to that target.  At the host firewall
+the daemon installs per-cell rules on the veth: **DNS (53) + every
+allowlisted address passes, everything else DROPs** (rules removed with
+the cell).
+
+Caveat: the daemon resolves each host once, at cell start, using the
+**host's** resolver.  The cell resolves with the resolvers packed into
+its rootfs (usually `1.1.1.1`/`8.8.8.8`), and CDNs may return a different
+anycast set to the two — in that case the cell dials an address the
+firewall does not allow.  If you see intermittent `network_denied` on a
+node, align the cell's `/etc/resolv.conf` with the host's upstreams, or
+front egress with a host-side CONNECT proxy (tracked in RFC 0001).
+
+## Env, secrets and a capped workspace
+
+```bash
+# plain env (visible in host `ps` — do NOT put secrets here)
+./sand --env RUST_BACKTRACE=1 -- cargo build
+
+# secrets: a 0600 file read by sand, values never touch argv
+printf 'GITHUB_TOKEN=ghp_x\n' > /tmp/cell.env && chmod 600 /tmp/cell.env
+./sand --env-file /tmp/cell.env -- gh auth status
+
+# a secret copied into the cell's tmpfs (RAM), mode 0600
+./sand --secret /run/agentcell-git/id_ed25519=$HOME/.ssh/id_ed25519 \
+       --env 'GIT_SSH_COMMAND=ssh -i /run/agentcell-git/id_ed25519' -- \
+       git clone git@github.com:org/repo
+
+# RAM-backed workspace with a hard size cap: a runaway build gets
+# ENOSPC instead of filling the node disk (counts against --mem)
+./sand --workdir-size 4G -- cargo build --release
+```
+
+`--secret DST=SRC` requires `DST` under `/tmp`, `/run` or `/var/tmp`
+(the cell's tmpfs mounts), so the payload never lands on the host disk.
 
 ## Docs
 
+- [CHANGELOG.md](CHANGELOG.md) — release notes
 - [RFC 0001: Keel & Zene Integration Roadmap](docs/rfcs/0001-keel-zene-integration.md) — requirements for ARM64, duplex MCP streaming, egress proxy, and Rust FFI.
 - [AgentCell OS](docs/agentcell-os.md) — dedicated host/kernel for speed
 - [os/](os/README.md) — phase-1 tree: kernel fragment, cell-root packer, **cell pool** (`pool.py`)
