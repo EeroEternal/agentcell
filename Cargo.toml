@@ -1,6 +1,6 @@
 [package]
 name = "agentcell"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.70"
 license = "MIT"
@@ -17,6 +17,7 @@ include = [
     "Cargo.toml",
     "build.rs",
     "LICENSE",
+    "CHANGELOG.md",
     "rust/**",
     "src/agentcell.h",
     "src/libagentcell.c",
