@@ -182,6 +182,27 @@ t_no "secret: tmpfs-only enforced" \
 t_out "workdir-size: hard cap" "8.0M" \
       ./sand --workdir-size 8M -- df -h /home/agent
 
+section "egress + capabilities"
+t_out "capabilities advertises egress_refresh" "egress_refresh=1" \
+      ./sand --capabilities
+t_no "egress: reject spaces" ./sand --egress 'bad host' -- true
+t_no "egress: reject IPv6 literal" ./sand --egress '::1' -- true
+# with no daemon running, a requested egress must fail loud, not fall back
+if [ ! -S /run/agentcell/lsm.sock ]; then
+    t_no "egress: loud when daemon missing" \
+         ./sand --egress static.crates.io -- true
+    ./sand --egress static.crates.io -- true >>"$LOG" 2>&1
+    if grep -q "egress unavailable" "$LOG"; then
+        pass "egress: names the reason"
+    else
+        fail "egress: names the reason"
+    fi
+    : > "$LOG"
+else
+    skip "egress: loud when daemon missing" "agentlsm daemon is running"
+    skip "egress: names the reason" "agentlsm daemon is running"
+fi
+
 section "io.max"
 SELF=$(sed -n 's|^0::||p' /proc/self/cgroup)
 BASE=$(echo "$SELF" | sed 's|\(/user@[0-9]*\.service\).*|\1|')
