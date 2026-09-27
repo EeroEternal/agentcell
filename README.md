@@ -364,8 +364,7 @@ crates.io wraps the same ABI (`agentcell::ffi` for the raw C functions).
 
 Outbound allowlist for agents that need a few API endpoints. Repeat the
 flag for each destination; the port defaults to 443 and **every A record**
-of each host is whitelisted (CDN registries rotate IPs, so a single
-resolved address is not enough):
+of each host is allowlisted:
 
 ```bash
 sudo ./agentlsm serve                       # once per boot
@@ -374,19 +373,27 @@ sudo ./agentlsm serve                       # once per boot
        --egress index.crates.io -- agent     # implies --net veth
 ```
 
+The cell's DNS does **not** come from its rootfs under veth: `sand` binds
+systemd-resolved's upstream list (`/run/systemd/resolve/resolv.conf`) over
+the cell's `/etc/resolv.conf`.  `sand` now sends those same nameservers to
+the daemon (`NETUP … RESOLV <addr>[:port] …`), which resolves each host
+against **them** — not the host stub — and **re-resolves on the record TTL**
+(capped at 60 s) while the cell lives.  CDNs like `static.crates.io` rotate
+addresses *within a single resolver*, so refresh, not one-shot resolution,
+is what makes the allowlist match what the cell actually dials.
+
+Failures are loud: if a host cannot be resolved the daemon replies
+`ERR egress_unresolved <host>` (or `egress_too_many_ips` / _hosts_) and
+rolls back the veth; `sand` then exits nonzero instead of silently falling
+back to `--net none`.  A transient failure during refresh keeps the last
+good set, so a flaky upstream does not break a running build.
+
 Inside the cell: with exactly one `--egress` entry,
 `http_proxy`/`https_proxy` are set to that target.  At the host firewall
 the daemon installs per-cell rules on the veth: **DNS (53) + every
 allowlisted address passes, everything else DROPs** (rules removed with
-the cell).
-
-Caveat: the daemon resolves each host once, at cell start, using the
-**host's** resolver.  The cell resolves with the resolvers packed into
-its rootfs (usually `1.1.1.1`/`8.8.8.8`), and CDNs may return a different
-anycast set to the two — in that case the cell dials an address the
-firewall does not allow.  If you see intermittent `network_denied` on a
-node, align the cell's `/etc/resolv.conf` with the host's upstreams, or
-front egress with a host-side CONNECT proxy (tracked in RFC 0001).
+the cell).  `sand --capabilities` reports `egress_multi`, `egress_refresh`
+and `egress_resolv` for hosts that want to gate on them.
 
 ## Env, secrets and a capped workspace
 

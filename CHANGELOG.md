@@ -3,6 +3,36 @@
 All notable changes to the `agentcell` crate and the `sand` / `agentlsm`
 binaries. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- Egress now resolves against the **cell's** nameservers. `sand` sends them
+  in `NETUP … RESOLV <addr>[:port] …` (parsed from systemd-resolved's
+  upstream list that it bind-mounts into the cell), and `agentlsm` resolves
+  each host with `res_nquery` against those servers instead of the host
+  stub. This removes the resolver skew that made the allowlist miss the
+  address the cell dials.
+- Egress addresses are **refreshed on the record TTL** (capped at 60 s)
+  while the cell lives, so CDNs that rotate addresses within one resolver
+  stay reachable. A transient refresh failure keeps the last good set.
+- Egress failures are loud: the daemon replies `ERR egress_unresolved
+  <host>` / `egress_too_many_ips` / `egress_too_many_hosts` (rolls back the
+  veth), and `sand` exits nonzero with `egress unavailable: <reason>`
+  instead of silently falling back to `--net none` when egress was
+  requested. The success reply now carries host/address counts.
+- `ERR line_too_long` is returned instead of silently discarding an
+  over-long control line; the `NETUP` builder no longer truncates (and
+  fails instead), and the control buffers were enlarged.
+
+### Added
+
+- `sand --capabilities` prints the feature flags (`egress_multi`,
+  `egress_refresh`, `egress_resolv`, `env`, `env_file`, `secret`,
+  `workdir_size`) for hosts to gate on.
+- `--egress` validation rejects empty/whitespace hosts, IPv6 literals
+  (unsupported by the AF_INET rules) and duplicates.
+
 ## 0.2.0 — 2026-09-27
 
 ### Added
