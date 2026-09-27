@@ -40,7 +40,7 @@ LSMOBJ = src/agentlsm.bpf.o
 LSMHDR = src/agentlsm.bpf.h
 
 agentlsm: src/agentlsm.c $(LSMHDR)
-	$(CC) $(CFLAGS) -include $(LSMHDR) -o $@ src/agentlsm.c -lbpf -lelf -lz
+	$(CC) $(CFLAGS) -include $(LSMHDR) -o $@ src/agentlsm.c -lbpf -lelf -lz -lresolv
 
 $(LSMOBJ): src/agentlsm.bpf.c src/vmlinux.h
 	$(CLANG) $(BPFFLAGS) -Isrc -c $< -o $@

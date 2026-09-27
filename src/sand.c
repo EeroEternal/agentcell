@@ -59,6 +59,7 @@
 
 #define MAXBIND 32
 #define MAX_EGRESS 16
+#define MAX_RESOLV 4
 #define MAX_ENV 64
 #define MAX_SECRET 8
 
@@ -183,6 +184,8 @@ struct cfg {
     char egress_host[MAX_EGRESS][128];  /* --egress HOST[:PORT] allowlist */
     char egress_port[MAX_EGRESS][8];
     int  n_egress;
+    char resolv[MAX_RESOLV][64];      /* cell's nameservers (veth) */
+    int  n_resolv;
     char *env[MAX_ENV]; int n_env;    /* --env / --env-file K=V */
     char secret_dst[MAX_SECRET][PATH_MAX];  /* --secret DST=SRC on tmpfs */
     char *secret_data[MAX_SECRET];
@@ -1503,7 +1506,7 @@ static int lsm_cmd(const char *cmd, char *rep, size_t repn)
 {
     int s = lsm_connect();
     if (s < 0) return -1;
-    char line[1024], scratch[64];
+    char line[4200], scratch[64];
     snprintf(line, sizeof line, "%s\n", cmd);
     if (write_full(s, line, strlen(line)) < 0) { close(s); return -1; }
     if (!rep) { rep = scratch; repn = sizeof scratch; }
@@ -1561,10 +1564,12 @@ static void lsm_unregister(void)
 }
 
 /* --egress HOST[:PORT]: append to the veth allowlist.  Port defaults
- * to 443 when omitted.  Returns 0 on success. */
+ * to 443 when omitted.  Returns 0 on success, -1 on invalid/overflow. */
 static int egress_add(const char *spec)
 {
-    if (C.n_egress >= MAX_EGRESS) return -1;
+    if (C.n_egress >= MAX_EGRESS || !*spec) return -1;
+    for (const char *q = spec; *q; q++)
+        if ((unsigned char)*q <= ' ') return -1;   /* no spaces/controls */
     const char *port = "443";
     size_t hl = strlen(spec);
     const char *c = strrchr(spec, ':');
@@ -1573,6 +1578,11 @@ static int egress_add(const char *spec)
         hl = (size_t)(c - spec);
     }
     if (hl == 0 || hl >= sizeof C.egress_host[0]) return -1;
+    if (memchr(spec, ':', hl)) return -1;          /* IPv6 literal: unsupported */
+    for (int i = 0; i < C.n_egress; i++)
+        if (!strncmp(C.egress_host[i], spec, hl) &&
+            !C.egress_host[i][hl] && !strcmp(C.egress_port[i], port))
+            return 0;                              /* duplicate: keep going */
     snprintf(C.egress_host[C.n_egress], sizeof C.egress_host[0],
              "%.*s", (int)hl, spec);
     snprintf(C.egress_port[C.n_egress], sizeof C.egress_port[0],
@@ -1651,20 +1661,90 @@ static int secret_add(const char *spec)
     return 0;
 }
 
+/* Parse `nameserver` lines from a resolv.conf into C.resolv[]. */
+static void resolv_add_file(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (strncmp(p, "nameserver", 10)) continue;
+        p += 10;
+        while (*p == ' ' || *p == '\t') p++;
+        char *e = p;
+        while (*e && !isspace((unsigned char)*e)) e++;
+        *e = 0;
+        if (!*p) continue;
+        int dup = 0;
+        for (int i = 0; i < C.n_resolv; i++)
+            if (!strcmp(C.resolv[i], p)) { dup = 1; break; }
+        if (!dup && C.n_resolv < MAX_RESOLV)
+            snprintf(C.resolv[C.n_resolv++], sizeof C.resolv[0], "%s", p);
+    }
+    fclose(f);
+}
+
+/* The cell's DNS source under veth is systemd-resolved's upstream list
+ * (do_mounts() binds it over the rootfs resolv.conf); fall back to the
+ * rootfs/host file only when that one is absent. */
+static void resolv_collect(void)
+{
+    C.n_resolv = 0;
+    resolv_add_file("/run/systemd/resolve/resolv.conf");
+    if (C.n_resolv == 0 && C.rootfs[0]) {
+        char p[PATH_MAX];
+        snprintf(p, sizeof p, "%s/etc/resolv.conf", C.rootfs);
+        resolv_add_file(p);
+    }
+    if (C.n_resolv == 0)
+        resolv_add_file("/etc/resolv.conf");
+}
+
 /* --net veth: the daemon (root) builds the pair + NAT; we configure
  * our end ourselves once it lands in the cell's netns.  The reply
- * rides the sync pipe: plain "x" means fallback to no network. */
+ * rides the sync pipe: plain "x" means fallback to no network.
+ * Returns 0 ok, -1 soft failure (no egress requested), -2 fatal. */
 static int net_veth_register(pid_t child)
 {
-    char cmd[1024], rep[128];
+    if (C.n_resolv == 0) resolv_collect();
+    char cmd[4096], rep[192] = {0};
     int off = snprintf(cmd, sizeof cmd, "NETUP %d", (int)child);
-    for (int i = 0; i < C.n_egress && off > 0 && off < (int)sizeof cmd; i++)
-        off += snprintf(cmd + off, sizeof cmd - (size_t)off,
-                        " EGRESS %s %s",
-                        C.egress_host[i], C.egress_port[i]);
+    for (int i = 0; i < C.n_egress; i++) {
+        int w = snprintf(cmd + off, sizeof cmd - (size_t)off,
+                         " EGRESS %s %s", C.egress_host[i], C.egress_port[i]);
+        if (w < 0 || off + w >= (int)sizeof cmd) {
+            fprintf(stderr, "sand: egress list too long for NETUP\n");
+            return -1;
+        }
+        off += w;
+    }
+    for (int i = 0; i < C.n_resolv; i++) {
+        int w = snprintf(cmd + off, sizeof cmd - (size_t)off,
+                         " RESOLV %s", C.resolv[i]);
+        if (w < 0 || off + w >= (int)sizeof cmd) {
+            fprintf(stderr, "sand: resolv list too long for NETUP\n");
+            return -1;
+        }
+        off += w;
+    }
     if (lsm_cmd(cmd, rep, sizeof rep) < 0 || strncmp(rep, "OK ", 3) ||
         sscanf(rep + 3, "%63s %63s %63s",
                C.veth_if, C.veth_ip, C.veth_gw) != 3) {
+        char reason[96];
+        if (rep[0]) {
+            int n = (int)strcspn(rep, "\r\n");
+            if (n >= (int)sizeof reason) n = (int)sizeof reason - 1;
+            memcpy(reason, rep, (size_t)n);
+            reason[n] = 0;
+        } else {
+            snprintf(reason, sizeof reason, "no agentlsm daemon");
+        }
+        if (C.n_egress > 0) {
+            fprintf(stderr, "sand: egress unavailable: %s\n", reason);
+            return -2;              /* do not silently drop to --net none */
+        }
         fprintf(stderr, "sand: --net veth needs the agentlsm daemon "
                         "(sudo agentlsm serve) — falling back to --net none\n");
         return -1;
@@ -2066,6 +2146,8 @@ static void usage(FILE *out)
 "  --deny PREFIX extra LSM deny prefix (repeatable, implies --secure;\n"
 "                paths as seen INSIDE the sandbox, e.g. /mnt/NAME)\n"
 "  --no-landlock | --no-seccomp   debug switches\n"
+"  --capabilities print feature flags (egress_multi, egress_refresh,\n"
+"                egress_resolv, env_file, secret, workdir_size) and exit\n"
 "  --io-rbps SIZE  io.max read bytes/s on the workspace device\n"
 "  --io-wbps SIZE  io.max write bytes/s (e.g. 8M; throttles disk writes)\n"
 "  --ask         park denied syscalls and ask the supervisor on /dev/tty\n"
@@ -2137,6 +2219,7 @@ int main(int argc, char **argv)
         {"env-file",    required_argument, 0, 1006},
         {"secret",      required_argument, 0, 1007},
         {"workdir-size",required_argument, 0, 1008},
+        {"capabilities",no_argument,      0, 1009},
         {"ask",         no_argument, &C.ask, 1},
         {"secure",      no_argument, &C.secure, 1},
         {"deny",        required_argument, 0, 'd'},
@@ -2221,6 +2304,10 @@ int main(int argc, char **argv)
             }
             break;
         case 1008: C.workdir_size = parse_mem(optarg); break;
+        case 1009:
+            printf("egress_multi=1 egress_refresh=1 egress_resolv=1 "
+                   "env=1 env_file=1 secret=1 workdir_size=1\n");
+            return 0;
         case 'd':
             if (C.n_deny < MAXBIND) {
                 snprintf(C.deny[C.n_deny], 256, "%s", optarg);
@@ -2330,8 +2417,18 @@ int main(int argc, char **argv)
     /* --net veth: the daemon moves one end of a fresh pair into the
      * child's netns (created by clone, child still waits on the pipe);
      * config travels to the child in the sync message itself */
-    if (C.netmode == NET_VETH)
-        net_veth_register(pid);
+    if (C.netmode == NET_VETH) {
+        int vr = net_veth_register(pid);
+        if (vr == -2) {
+            /* egress was requested but could not be provisioned: fail loud
+             * instead of handing back a cell with no network */
+            kill(pid, SIGKILL);
+            waitpid(pid, NULL, 0);
+            if (C.secure && g_have_cg) lsm_unregister();
+            if (g_have_cg) rmdir(g_cgpath);
+            _exit(127);
+        }
+    }
 
     char syncmsg[160] = "x";
     if (g_veth_on)
