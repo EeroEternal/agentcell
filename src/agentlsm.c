@@ -590,6 +590,17 @@ static int net_up(pid_t pid, char *rep, size_t repn,
         egress_apply(slot, want, n);
         g_nets[slot].next_refresh =
             time(NULL) + (ttl > 0 && ttl < EG_TTL_CAP ? ttl : EG_TTL_CAP);
+    } else {
+        /* No allowlist was requested, so the cell falls through to the
+         * global `FORWARD -s 10.200.0.0/16 -j ACCEPT` installed by
+         * nat_ensure() and can reach anything it can route.  That is what
+         * plain `--net veth` means (real networking with NAT), but it is
+         * also what an integrator gets by passing veth and forgetting
+         * --egress, so say it in the journal instead of leaving the only
+         * evidence in the reader's head. */
+        fprintf(stderr, "agentlsm: WARNING: veth%d (pid %ld) has no egress "
+                        "allowlist — unrestricted NAT\n",
+                idx, (long)pid);
     }
     snprintf(rep, repn, "OK vethc%d 10.200.%u.%u 10.200.%u.%u %d %d\n",
              idx, (b + 2) >> 8, (b + 2) & 255,
