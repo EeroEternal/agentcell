@@ -3,6 +3,29 @@
 All notable changes to the `agentcell` crate and the `sand` / `agentlsm`
 binaries. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## 0.2.2 — 2026-09-28
+
+### Fixed
+
+- `sand` now requires the egress counts in the `NETUP` reply. When egress
+  was requested it demands all five fields, `n_hosts == the requested host
+  count` and `n_ips > 0`; a pre-0.2.1 daemon — which ignores the `RESOLV`
+  token, installs *no* accept rules and still answers `OK <if> <cell>
+  <gw>` — no longer reads as success. Mismatches take the existing
+  `egress unavailable` path (exit 127, no silent `--net none` fallback).
+  The three-field reply is still accepted when no egress was requested.
+
+### Added
+
+- `agentlsm` logs a warning when a veth is built with **no** egress
+  allowlist (`WARNING: vethN (pid P) has no egress allowlist — unrestricted
+  NAT`). Plain `--net veth` remains real networking with NAT; this only
+  makes the situation visible in the journal.
+- `AGENTCELL_LSM_SOCK` overrides the daemon control socket path, and
+  `tests/stub-agentlsm.c` drives the `NETUP` reply branches without root; the
+  new `tests/run.sh` cases cover the old/short/zero-address replies and show
+  the 0.2.1 reply is still accepted.
+
 ## 0.2.1 — 2026-09-27
 
 ### Fixed
