@@ -1487,11 +1487,22 @@ static int client_exec(char **av)
 
 #define LSM_SOCK "/run/agentcell/lsm.sock"
 
+/* Path of the daemon's control socket.  The override exists so the control
+ * protocol can be tested against a stub with no root and no live daemon;
+ * it is a test seam, not a trust boundary (the caller already picks the
+ * environment of its own cell, and the rules are installed by the root
+ * daemon either way). */
+static const char *lsm_sock_path(void)
+{
+    const char *e = getenv("AGENTCELL_LSM_SOCK");
+    return (e && *e) ? e : LSM_SOCK;
+}
+
 static int lsm_connect(void)
 {
     int s = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un a = { .sun_family = AF_UNIX };
-    snprintf(a.sun_path, sizeof a.sun_path, "%s", LSM_SOCK);
+    snprintf(a.sun_path, sizeof a.sun_path, "%s", lsm_sock_path());
     if (connect(s, (struct sockaddr *)&a, sizeof a) < 0) {
         close(s);
         return -1;
@@ -1729,18 +1740,41 @@ static int net_veth_register(pid_t child)
         }
         off += w;
     }
-    if (lsm_cmd(cmd, rep, sizeof rep) < 0 || strncmp(rep, "OK ", 3) ||
-        sscanf(rep + 3, "%63s %63s %63s",
-               C.veth_if, C.veth_ip, C.veth_gw) != 3) {
-        char reason[96];
-        if (rep[0]) {
-            int n = (int)strcspn(rep, "\r\n");
-            if (n >= (int)sizeof reason) n = (int)sizeof reason - 1;
-            memcpy(reason, rep, (size_t)n);
-            reason[n] = 0;
-        } else {
-            snprintf(reason, sizeof reason, "no agentlsm daemon");
-        }
+    /* The daemon reports how many hosts and addresses it actually
+     * installed (agentlsm >= 0.2.1).  When egress was requested we require
+     * those counts: a pre-0.2.1 daemon stops parsing after the pid, sees the
+     * RESOLV token where it expects EGRESS, resolves nothing, installs no
+     * accept rules at all -- and still answers "OK <if> <cell> <gw>", which
+     * the old three-field check accepted.  The cell then runs with no
+     * egress while both sides report success.  Without egress requested we
+     * stay tolerant of the older reply. */
+    int n_hosts = -1, n_ips = -1, fields = -1;
+    if (lsm_cmd(cmd, rep, sizeof rep) >= 0 && !strncmp(rep, "OK ", 3))
+        fields = sscanf(rep + 3, "%63s %63s %63s %d %d",
+                        C.veth_if, C.veth_ip, C.veth_gw, &n_hosts, &n_ips);
+
+    /* the daemon's first line, for diagnostics */
+    char said[96] = "";
+    if (rep[0]) {
+        int n = (int)strcspn(rep, "\r\n");
+        if (n >= (int)sizeof said) n = (int)sizeof said - 1;
+        memcpy(said, rep, (size_t)n);
+        said[n] = 0;
+    }
+
+    char reason[128] = "";
+    if (fields < 3) {
+        if (said[0]) snprintf(reason, sizeof reason, "%s", said);
+        else         snprintf(reason, sizeof reason, "no agentlsm daemon");
+    } else if (C.n_egress > 0 && fields != 5) {
+        snprintf(reason, sizeof reason,
+                 "agentlsm did not report egress counts (%s)", said);
+    } else if (C.n_egress > 0 && (n_hosts != C.n_egress || n_ips <= 0)) {
+        snprintf(reason, sizeof reason,
+                 "agentlsm installed %d of %d host(s), %d address(es)",
+                 n_hosts, C.n_egress, n_ips);
+    }
+    if (reason[0]) {
         if (C.n_egress > 0) {
             fprintf(stderr, "sand: egress unavailable: %s\n", reason);
             return -2;              /* do not silently drop to --net none */

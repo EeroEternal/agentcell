@@ -38,6 +38,17 @@ t_out(){ local n=$1 p=$2; shift 2
 # t_rc NAME WANT cmd...   — expect exact exit code
 t_rc(){ local n=$1 want=$2; shift 2
          "$@" >>"$LOG" 2>&1; [ $? = "$want" ] && pass "$n" || fail "$n"; }
+# t_err_out NAME PATTERN cmd... — expect nonzero exit AND PATTERN in the output
+t_err_out(){ local n=$1 p=$2; shift 2
+         "$@" >>"$LOG" 2>&1; local rc=$?
+         if [ "$rc" != 0 ] && grep -q -- "$p" "$LOG"; then pass "$n"
+         else fail "$n (rc=$rc)"; fi
+         : > "$LOG"; }
+# t_not_out NAME PATTERN cmd... — expect PATTERN NOT in the output
+t_not_out(){ local n=$1 p=$2; shift 2
+         "$@" >>"$LOG" 2>&1
+         if grep -q -- "$p" "$LOG"; then fail "$n"; else pass "$n"; fi
+         : > "$LOG"; }
 
 wait_sock(){ # PATH — up to 5s for the serve socket to appear
     for _ in $(seq 50); do [ -S "$1" ] && return 0; sleep 0.1; done; return 1; }
@@ -55,10 +66,11 @@ sudook(){
 lsmok(){ sudook && $SUDO cat /sys/kernel/security/lsm 2>/dev/null \
                   | tr ',' '\n' | grep -qx bpf; }
 
-DAEMON_PID=""; CELL_PID=""
+DAEMON_PID=""; CELL_PID=""; STUB_PID=""
 cleanup(){
     trap - EXIT
     [ -n "$CELL_PID" ] && kill "$CELL_PID" 2>/dev/null
+    [ -n "$STUB_PID" ] && { kill -9 "$STUB_PID" 2>/dev/null; wait "$STUB_PID" 2>/dev/null; }
     if [ -n "$DAEMON_PID" ]; then
         $SUDO pkill -TERM -x agentlsm 2>/dev/null
         for _ in $(seq 30); do $SUDO kill -0 "$DAEMON_PID" 2>/dev/null || break
@@ -201,6 +213,61 @@ if [ ! -S /run/agentcell/lsm.sock ]; then
 else
     skip "egress: loud when daemon missing" "agentlsm daemon is running"
     skip "egress: names the reason" "agentlsm daemon is running"
+fi
+
+section "egress: NETUP reply contract"
+# The daemon reports how many hosts/addresses it installed.  `sand` must not
+# accept a reply that does not account for what was requested: a pre-0.2.1
+# daemon ignores the RESOLV token, installs no accept rules, and still
+# answers "OK <if> <cell> <gw>" — the cell would come up with no egress while
+# both sides report success.  Driven against tests/stub-agentlsm, no root.
+STUB="./tests/stub-agentlsm"
+if [ ! -x "$STUB" ]; then
+    skip "egress: reply contract" "tests/stub-agentlsm not built (make check)"
+else
+    STUBSOCK="$RT/lsm.sock"
+    stub_start(){ # MODE
+        [ -n "$STUB_PID" ] && kill "$STUB_PID" 2>/dev/null
+        rm -f "$STUBSOCK"
+        # output to $LOG: a stub that somehow outlives its test must not hold
+        # the harness's stdout open (that stalls a `make check | tee` pipe)
+        "$STUB" "$STUBSOCK" "$1" >>"$LOG" 2>&1 &
+        STUB_PID=$!
+        wait_sock "$STUBSOCK"
+    }
+    stub_stop(){
+        [ -n "$STUB_PID" ] || return 0
+        kill "$STUB_PID" 2>/dev/null
+        for _ in $(seq 20); do kill -0 "$STUB_PID" 2>/dev/null || break; sleep 0.05; done
+        kill -9 "$STUB_PID" 2>/dev/null
+        wait "$STUB_PID" 2>/dev/null
+        STUB_PID=""
+    }
+
+    for spec in "v020:old daemon, no counts" \
+                "short:fewer hosts installed than asked" \
+                "zeroips:no addresses resolved"; do
+        mode="${spec%%:*}"; desc="${spec#*:}"
+        if stub_start "$mode"; then
+            AGENTCELL_LSM_SOCK="$STUBSOCK" t_err_out \
+                "egress: fatal on $desc" "egress unavailable" \
+                timeout 20 ./sand --egress static.crates.io --net veth -- true
+        else
+            fail "egress: fatal on $desc (stub did not start)"
+        fi
+        stub_stop
+    done
+
+    # the reply this sand expects must still be accepted (the cell then fails
+    # later, unprivileged, on the missing veth — but not on the contract)
+    if stub_start v021; then
+        AGENTCELL_LSM_SOCK="$STUBSOCK" t_not_out \
+            "egress: 0.2.1 counts accepted" "egress unavailable" \
+            timeout 20 ./sand --egress static.crates.io --net veth -- true
+    else
+        fail "egress: 0.2.1 counts accepted (stub did not start)"
+    fi
+    stub_stop
 fi
 
 section "io.max"
