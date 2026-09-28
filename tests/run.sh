@@ -418,6 +418,14 @@ if lsmok; then
     t_out "veth NAT + DNS outbound" "HTTP" \
           ./sand --net veth -- curl -sI --max-time 5 https://example.com
 
+    # that reachability is the point: a veth with no allowlist is
+    # unrestricted NAT, so the daemon must say so in its log
+    if grep -q "no egress allowlist" "$RT/lsm.log"; then
+        pass "veth without allowlist warns"
+    else
+        fail "veth without allowlist warns"
+    fi
+
     # egress allowlist: DNS + the one allowed dst pass, all else DROP
     t_out "egress: allowed dst reachable" "HTTP" \
           ./sand --net veth --egress 1.1.1.1:443 -- \
