@@ -321,6 +321,24 @@ static int resolve_egress(const char *host, const char *port,
                           int *ttl_min)
 {
     int got_any = 0;
+    /* A literal IP is its own answer: never hand it to DNS.  Nodes behind
+     * a fake-ip TUN proxy answer A queries for ANY name -- including a
+     * numeric one -- with a bogus 198.18.0.0/15 address, so the allowlist
+     * would not match the address the cell actually dials (issue #7).
+     * Literals never age, so no refresh TTL is recorded. */
+    struct in_addr lit;
+    if (inet_pton(AF_INET, host, &lit) == 1) {
+        char ip[64];
+        if (!inet_ntop(AF_INET, &lit, ip, sizeof ip)) return -1;
+        for (int j = 0; j < *n_want; j++)
+            if (!strcmp(want[j].ip, ip) && !strcmp(want[j].port, port))
+                return 0;
+        if (*n_want >= max) return -2;
+        snprintf(want[*n_want].ip, 64, "%s", ip);
+        snprintf(want[*n_want].port, 8, "%s", port);
+        (*n_want)++;
+        return 0;
+    }
     if (n_ns > 0) {
         for (int k = 0; k < n_ns; k++) {
             struct __res_state st;
@@ -533,10 +551,15 @@ static void ipfwd_recover(void)
 static void egress_base(int idx, int add)
 {
     const char *op = add ? "-I FORWARD 1" : "-D FORWARD";
-    sh("iptables %s FORWARD -i vethh%d -j DROP 2>/dev/null", op, idx);
-    sh("iptables %s FORWARD -i vethh%d -m conntrack "
+    /* op already carries the chain name -- a literal FORWARD here would
+     * double it ("iptables -I FORWARD 1 FORWARD ...") and every rule
+     * install would fail silently.  Caught by the v0.2.3 certification
+     * on a real node (issue #7): the suite's veth tiers passed only
+     * because their assertions never depend on the base rules. */
+    sh("iptables %s -i vethh%d -j DROP 2>/dev/null", op, idx);
+    sh("iptables %s -i vethh%d -m conntrack "
        "--ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null", op, idx);
-    sh("iptables %s FORWARD -i vethh%d -p udp --dport 53 "
+    sh("iptables %s -i vethh%d -p udp --dport 53 "
        "-j ACCEPT 2>/dev/null", op, idx);
 }
 
@@ -545,7 +568,7 @@ static void egress_base(int idx, int add)
 static int egress_accept(int idx, const char *ip, const char *port, int add)
 {
     const char *op = add ? "-I FORWARD 1" : "-D FORWARD";
-    return sh("iptables %s FORWARD -i vethh%d -p tcp -d %s --dport %s "
+    return sh("iptables %s -i vethh%d -p tcp -d %s --dport %s "
               "-j ACCEPT 2>/dev/null", op, idx, ip, port);
 }
 
@@ -561,7 +584,7 @@ static void net_recover_startup(void)
        " | sed -n 's/^[0-9]*: \\(vethh[0-9]*\\)@.*/\\1/p'"
        " | while read -r v; do"
        "   ip link del \"$v\" 2>/dev/null"
-       "   && echo \"agentlsm: removed stale $v from a previous run\""
+       "   && echo \"agentlsm: removed stale $v from a previous run\";"
        " done >&2");
     sh("iptables-save 2>/dev/null | grep -E -- '-[io] vethh[0-9]+( |$)'"
        " | sed 's/^-A/-D/'"
