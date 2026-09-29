@@ -178,6 +178,7 @@ struct conn {
     __u32 mask;                 /* event classes this watcher wants */
     char  buf[4096];
     size_t len;
+    int   drain;                /* swallowing the tail of an over-long line */
 };
 static struct conn g_conn[MAX_WATCH];
 
@@ -187,6 +188,7 @@ static void conn_drop(int i)
     g_conn[i].fd = -1;
     g_conn[i].watcher = 0;
     g_conn[i].mask = 0;
+    g_conn[i].drain = 0;
 }
 
 /* fan one formatted line out to all watchers (best effort); the
@@ -274,7 +276,8 @@ static int on_evt(void *ctx, void *data, size_t size)
 struct egpair { char ip[64]; char port[8]; };
 struct eghost { char host[128]; char port[8]; };
 
-static void egress_accept(int idx, const char *ip, const char *port, int add);
+static int  egress_accept(int idx, const char *ip, const char *port, int add);
+static void net_recover_startup(void);
 
 static __u64 g_netmap[256];                    /* 16384 /30s, one bit each */
 static struct {
@@ -323,6 +326,11 @@ static int resolve_egress(const char *host, const char *port,
             if (res_ninit(&st)) continue;
             st.nscount = 1;
             st.nsaddr_list[0] = ns[k];
+            /* NETUP and the refresh loop resolve inline in serve_loop;
+             * the 5s x retries defaults would stall every control client
+             * for minutes when a nameserver is unreachable */
+            st.retrans = 1;
+            st.retry = 1;
             unsigned char buf[4096];
             int r = res_nquery(&st, host, C_IN, T_A, buf, sizeof buf);
             if (r > 0) {
@@ -424,8 +432,13 @@ static void egress_apply(int slot, const struct egpair *want, int n_want)
             if (!strcmp(g_nets[slot].eg[i].ip, want[j].ip) &&
                 !strcmp(g_nets[slot].eg[i].port, want[j].port)) { have = 1; break; }
         if (have) continue;
+        if (egress_accept(g_nets[slot].idx, want[j].ip, want[j].port, 1)) {
+            fprintf(stderr, "agentlsm: egress: veth%d: ACCEPT %s:%s "
+                            "failed to install\n",
+                    g_nets[slot].idx, want[j].ip, want[j].port);
+            continue;                       /* never count a missing rule */
+        }
         g_nets[slot].eg[g_nets[slot].n_eg++] = want[j];
-        egress_accept(g_nets[slot].idx, want[j].ip, want[j].port, 1);
     }
 }
 
@@ -517,11 +530,37 @@ static void egress_base(int idx, int add)
        "-j ACCEPT 2>/dev/null", op, idx);
 }
 
-static void egress_accept(int idx, const char *ip, const char *port, int add)
+/* Returns 0 only when the rule is in the kernel; callers must not
+ * account a rule that failed to install. */
+static int egress_accept(int idx, const char *ip, const char *port, int add)
 {
     const char *op = add ? "-I FORWARD 1" : "-D FORWARD";
-    sh("iptables %s FORWARD -i vethh%d -p tcp -d %s --dport %s "
-       "-j ACCEPT 2>/dev/null", op, idx, ip, port);
+    return sh("iptables %s FORWARD -i vethh%d -p tcp -d %s --dport %s "
+              "-j ACCEPT 2>/dev/null", op, idx, ip, port);
+}
+
+/* A previous daemon run may have died without cleanup, leaving vethh*
+ * links and their iptables rules behind.  The fresh daemon starts with an
+ * empty netmap, so nothing found here belongs to a live cell of ours: the
+ * orphaned cells already lost their policy owner.  Remove the pairs and
+ * every rule that mentions them, or idx reuse grafts a dead cell's
+ * allowlist onto a new one. */
+static void net_recover_startup(void)
+{
+    sh("ip -o link show 2>/dev/null"
+       " | sed -n 's/^[0-9]*: \\(vethh[0-9]*\\)@.*/\\1/p'"
+       " | while read -r v; do"
+       "   ip link del \"$v\" 2>/dev/null"
+       "   && echo \"agentlsm: removed stale $v from a previous run\""
+       " done >&2");
+    sh("iptables-save 2>/dev/null | grep -E -- '-[io] vethh[0-9]+( |$)'"
+       " | sed 's/^-A/-D/'"
+       " | while read -r r; do iptables $r 2>/dev/null; done");
+    /* and any global NAT rules a dead run left behind */
+    sh("iptables -t nat -D POSTROUTING -s 10.200.0.0/16 -j MASQUERADE 2>/dev/null");
+    sh("iptables -D FORWARD -s 10.200.0.0/16 -j ACCEPT 2>/dev/null");
+    sh("iptables -D FORWARD -d 10.200.0.0/16 -j ACCEPT 2>/dev/null");
+    sh("iptables -D FORWARD -s 10.200.0.0/16 -d 169.254.0.0/16 -j DROP 2>/dev/null");
 }
 
 static int net_up(pid_t pid, char *rep, size_t repn,
@@ -546,7 +585,16 @@ static int net_up(pid_t pid, char *rep, size_t repn,
     unsigned b = idx * 4;
     if (sh("ip link add vethh%d type veth peer name vethc%d 2>/dev/null",
            idx, idx)) {
-        sh("ip link del vethh%d 2>/dev/null", idx);   /* stale from a crash */
+        /* stale from a crash: the link outlived the daemon, and so did its
+         * iptables rules -- including the previous cell's per-IP ACCEPTs.
+         * Scrub everything that mentions this veth, or the new cell would
+         * silently inherit the old cell's allowlist. */
+        fprintf(stderr, "agentlsm: veth%d: stale link from a previous run\n",
+                idx);
+        sh("ip link del vethh%d 2>/dev/null", idx);
+        sh("iptables-save 2>/dev/null | grep -E -- '-[io] vethh%d( |$)'"
+           " | sed 's/^-A/-D/'"
+           " | while read -r r; do iptables $r 2>/dev/null; done", idx);
         if (sh("ip link add vethh%d type veth peer name vethc%d", idx, idx))
             goto fail;
     }
@@ -615,6 +663,7 @@ fail:
     g_nets[slot].n_eg = 0;
     g_nets[slot].n_hosts = 0;
     g_nets[slot].n_ns = 0;
+    g_nets[slot].next_refresh = 0;
     return -1;
 }
 
@@ -786,10 +835,15 @@ static void serve_line(int ci, char *line)
         }
         if (ok && too_many)
             snprintf(rep, sizeof rep, "ERR egress_too_many_hosts\n");
-        else if (ok && !net_up((pid_t)pid, rep, sizeof rep, hosts, ports,
-                               n_eg, nss, n_ns))
-            ;                                   /* net_up filled rep */
-        else
+        else if (ok) {
+            /* net_up names its own failures (egress_unresolved,
+             * egress_too_many_ips); only fall back to the generic reply
+             * when it could not write one of those */
+            rep[0] = 0;
+            if (net_up((pid_t)pid, rep, sizeof rep, hosts, ports,
+                       n_eg, nss, n_ns) != 0 && !rep[0])
+                snprintf(rep, sizeof rep, "ERR netup\n");
+        } else
             snprintf(rep, sizeof rep, "ERR netup\n");
     } else if (!strncmp(line, "NETDOWN ", 8)) {
         long pid;
@@ -813,6 +867,8 @@ static int serve_mode(void)
         return 1;
     }
     if (bpf_load_attach(0, 1, 0, 0, 0 /* MODE_SERVE */)) return 1;
+
+    net_recover_startup();
 
     mkdir("/run/agentcell", 0755);
     unlink(LSM_SOCK);
@@ -878,25 +934,41 @@ static int serve_mode(void)
             ssize_t r = read(g_conn[i].fd, b,
                              sizeof g_conn[i].buf - 1 - g_conn[i].len);
             if (r <= 0) { conn_drop(i); continue; }
-            g_conn[i].len += r;
-            g_conn[i].buf[g_conn[i].len] = 0;
 
-            /* process complete lines */
-            char *nl;
-            while ((nl = strchr(g_conn[i].buf, '\n'))) {
-                *nl = 0;
-                serve_line(i, g_conn[i].buf);
-                if (g_conn[i].fd < 0) break;         /* QUIT */
-                size_t rest = strlen(nl + 1);
-                memmove(g_conn[i].buf, nl + 1, rest);
+            if (g_conn[i].drain) {
+                /* an over-long line is in flight: swallow bytes up to and
+                 * including its newline so the tail is never parsed as new
+                 * commands, then resume normal parsing */
+                char *nl2 = memchr(g_conn[i].buf, '\n', (size_t)r);
+                if (!nl2) continue;
+                g_conn[i].drain = 0;
+                size_t rest = (size_t)(r - (nl2 - b) - 1);
+                memmove(g_conn[i].buf, nl2 + 1, rest);
                 g_conn[i].len = rest;
                 g_conn[i].buf[g_conn[i].len] = 0;
+            } else {
+                g_conn[i].len += r;
+                g_conn[i].buf[g_conn[i].len] = 0;
+
+                /* process complete lines */
+                char *nl;
+                while ((nl = strchr(g_conn[i].buf, '\n'))) {
+                    *nl = 0;
+                    serve_line(i, g_conn[i].buf);
+                    if (g_conn[i].fd < 0) break;         /* QUIT */
+                    size_t rest = strlen(nl + 1);
+                    memmove(g_conn[i].buf, nl + 1, rest);
+                    g_conn[i].len = rest;
+                    g_conn[i].buf[g_conn[i].len] = 0;
+                }
             }
-            if (g_conn[i].len >= sizeof g_conn[i].buf - 1) {
+            if (g_conn[i].fd >= 0 &&
+                g_conn[i].len >= sizeof g_conn[i].buf - 1) {
                 static const char err[] = "ERR line_too_long\n";
                 if (write(g_conn[i].fd, err, sizeof err - 1) < 0)
                     conn_drop(i);
                 g_conn[i].len = 0;                    /* drop the partial line */
+                g_conn[i].drain = 1;  /* and the rest of it, wherever it is */
             }
         }
     }

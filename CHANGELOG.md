@@ -3,6 +3,31 @@
 All notable changes to the `agentcell` crate and the `sand` / `agentlsm`
 binaries. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- `agentlsm serve` now honors its own NETUP error contract: a failed NETUP
+  no longer overwrites the specific `ERR egress_unresolved <host>` /
+  `ERR egress_too_many_ips` replies with a generic `ERR netup`, so clients
+  finally see *why* egress provisioning failed.
+- A crashed/restarted daemon no longer leaks state into new cells. On
+  startup (and when a NETUP recycles a veth index whose stale link survived
+  a crash) it removes leftover `vethh*` pairs and every iptables rule that
+  mentions them — previously the previous cell's per-IP ACCEPT rules
+  survived the crash and silently grafted its allowlist onto the next cell
+  using that index. Leftover global NAT rules are cleaned up too.
+- `egress_apply` no longer counts a rule that `iptables -I` failed to
+  install; the NETUP reply's address count is now the truth, and failures
+  are logged per rule.
+- Egress resolution is bounded (1 s per nameserver attempt) instead of the
+  resolver defaults; NETUP and the TTL refresh run inline in the serve
+  loop, and the old defaults could stall every control client for minutes
+  when a nameserver was unreachable.
+- An over-long control line no longer desynchronizes the protocol: after
+  `ERR line_too_long`, the daemon drains the rest of the offending line
+  instead of parsing its tail as new commands.
+
 ## 0.2.2 — 2026-09-28
 
 ### Fixed
