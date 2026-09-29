@@ -88,6 +88,13 @@ done
 t_out "sand --help mentions serve"   "serve"   ./sand --help
 t_out "sand --help mentions lsm"     "lsm"     ./sand --help
 
+section "control reply contract"
+if [ -x ./tests/contract_test ]; then
+    t_ok "netup reply + drain math" ./tests/contract_test
+else
+    skip "netup reply + drain math" "tests/contract_test not built (make check)"
+fi
+
 section "arch tables"
 if cat > "$RT/acchk.c" <<'ACEOF'
 #include <stdio.h>

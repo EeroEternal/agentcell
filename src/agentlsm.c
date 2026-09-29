@@ -61,6 +61,7 @@
 #include <resolv.h>
 #include <stdarg.h>
 #include "arch/syscalls.h"   /* AC_* syscall table */
+#include "netup_reply.h"     /* reply policy + drain math (testable) */
 
 static const struct ac_sys ac_syscalls[] = { AC_SYSCALL_TAB };
 #include <poll.h>
@@ -833,18 +834,14 @@ static void serve_line(int ci, char *line)
                 break;                        /* unknown token */
             }
         }
-        if (ok && too_many)
-            snprintf(rep, sizeof rep, "ERR egress_too_many_hosts\n");
-        else if (ok) {
-            /* net_up names its own failures (egress_unresolved,
-             * egress_too_many_ips); only fall back to the generic reply
-             * when it could not write one of those */
-            rep[0] = 0;
-            if (net_up((pid_t)pid, rep, sizeof rep, hosts, ports,
-                       n_eg, nss, n_ns) != 0 && !rep[0])
-                snprintf(rep, sizeof rep, "ERR netup\n");
-        } else
-            snprintf(rep, sizeof rep, "ERR netup\n");
+        int rc = 0;
+        rep[0] = 0;
+        if (ok && !too_many)
+            rc = net_up((pid_t)pid, rep, sizeof rep, hosts, ports,
+                        n_eg, nss, n_ns);
+        /* keep net_up()'s specific ERR egress_* reply; only an unnamed
+         * failure becomes the generic one (see netup_reply.h) */
+        netup_reply(ok, too_many, rc, rep, sizeof rep);
     } else if (!strncmp(line, "NETDOWN ", 8)) {
         long pid;
         if (sscanf(line + 8, "%ld", &pid) == 1)
@@ -939,12 +936,13 @@ static int serve_mode(void)
                 /* an over-long line is in flight: swallow bytes up to and
                  * including its newline so the tail is never parsed as new
                  * commands, then resume normal parsing */
-                char *nl2 = memchr(g_conn[i].buf, '\n', (size_t)r);
-                if (!nl2) continue;
+                ssize_t keep = drain_resume(g_conn[i].buf, (size_t)r);
+                if (keep < 0) continue;
                 g_conn[i].drain = 0;
-                size_t rest = (size_t)(r - (nl2 - b) - 1);
-                memmove(g_conn[i].buf, nl2 + 1, rest);
-                g_conn[i].len = rest;
+                memmove(g_conn[i].buf,
+                        g_conn[i].buf + ((size_t)r - (size_t)keep),
+                        (size_t)keep);
+                g_conn[i].len = (size_t)keep;
                 g_conn[i].buf[g_conn[i].len] = 0;
             } else {
                 g_conn[i].len += r;
