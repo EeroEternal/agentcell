@@ -22,6 +22,7 @@
  */
 #define _GNU_SOURCE
 #include <ctype.h>
+#include <stddef.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -2064,15 +2065,9 @@ static int child_main(void *arg)
         setenv("LANG",   "C.UTF-8", 1);
         setenv("TERM",   "xterm-256color", 1);
     }
-    if (C.n_egress == 1) {
-        char p[192];
-        snprintf(p, sizeof p, "http://%s:%s",
-                 C.egress_host[0], C.egress_port[0]);
-        setenv("http_proxy",  p, 1);
-        setenv("https_proxy", p, 1);
-        setenv("all_proxy",   p, 1);
-        setenv("no_proxy", "localhost,127.0.0.1", 1);
-    }
+    /* no auto http_proxy: the veth+iptables path needs no proxy, and a
+     * single FQDN entry is not a proxy -- pointing clients at it broke
+     * curl/cargo/git-http instantly (observed on a real node, 2026-09-29) */
     /* --env / --env-file override the defaults and any spawn envp */
     for (int i = 0; i < C.n_env; i++) {
         char *eq = strchr(C.env[i], '=');
