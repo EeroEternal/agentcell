@@ -53,13 +53,14 @@ int main(void)
     /* net_up failed without naming a reason -> generic */
     expect_reply(1, 0, -1, "", "ERR netup\n", "unnamed failure");
 
-    /* a cell that wants egress but sent no resolvers is refused loudly */
+    /* a hostname allowlist without resolvers is refused; a literal-IP one
+     * needs no DNS and passes */
     if (!egress_no_resolv(1, 0)) {
-        fprintf(stderr, "FAIL no-resolv: egress without resolvers should be rejected\n");
+        fprintf(stderr, "FAIL no-resolv: hostname allowlist without resolvers must be rejected\n");
         failures++;
     }
     if (egress_no_resolv(0, 0)) {
-        fprintf(stderr, "FAIL no-resolv: no egress needs no resolvers\n");
+        fprintf(stderr, "FAIL no-resolv: literal-IP allowlist needs no resolvers\n");
         failures++;
     }
     if (egress_no_resolv(1, 2)) {

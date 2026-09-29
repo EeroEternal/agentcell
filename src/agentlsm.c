@@ -412,8 +412,9 @@ static int egress_want(int slot, struct egpair *want, int *n_want,
 }
 
 /* Diff the installed accept rules against `want` and apply the delta. */
-static void egress_apply(int slot, const struct egpair *want, int n_want)
+static int egress_apply(int slot, const struct egpair *want, int n_want)
 {
+    int failed = 0;
     for (int i = 0; i < g_nets[slot].n_eg; ) {
         int keep = 0;
         for (int j = 0; j < n_want; j++)
@@ -434,10 +435,12 @@ static void egress_apply(int slot, const struct egpair *want, int n_want)
             fprintf(stderr, "agentlsm: egress: veth%d: ACCEPT %s:%s "
                             "failed to install\n",
                     g_nets[slot].idx, want[j].ip, want[j].port);
+            failed++;
             continue;                       /* never count a missing rule */
         }
         g_nets[slot].eg[g_nets[slot].n_eg++] = want[j];
     }
+    return failed;
 }
 
 /* Re-resolve every live cell that is due.  A transient failure keeps the
@@ -615,6 +618,14 @@ static int net_up(pid_t pid, char *rep, size_t repn,
         }
     if (idx < 0) return -1;
 
+    /* claim the slot before any goto fail so the rollback can scrub what we
+     * install */
+    g_nets[slot].idx = idx;
+    g_nets[slot].n_eg = 0;
+    g_nets[slot].n_hosts = 0;
+    g_nets[slot].n_ns = 0;
+    g_nets[slot].next_refresh = 0;
+
     /* b = idx*4: 10.200.<b+1>/30 host end, 10.200.<b+2> cell end */
     unsigned b = idx * 4;
     if (sh("ip link add vethh%d type veth peer name vethc%d 2>/dev/null",
@@ -639,11 +650,6 @@ static int net_up(pid_t pid, char *rep, size_t repn,
 
     nat_ensure();
     g_nets[slot].pid = pid;
-    g_nets[slot].idx = idx;
-    g_nets[slot].n_eg = 0;
-    g_nets[slot].n_hosts = 0;
-    g_nets[slot].n_ns = 0;
-    g_nets[slot].next_refresh = 0;
     for (int h = 0; h < n_eg && h < MAX_EGRESS; h++) {
         snprintf(g_nets[slot].hosts[h].host,
                  sizeof g_nets[slot].hosts[h].host, "%s", hosts[h]);
@@ -657,8 +663,17 @@ static int net_up(pid_t pid, char *rep, size_t repn,
 
     /* An old `sand` (or one that found no nameserver) sends no RESOLV; the
      * daemon can no longer resolve the way the cell does, so refuse loudly
-     * instead of silently using the host stub (resolver skew). */
-    if (egress_no_resolv(n_eg, g_nets[slot].n_ns)) {
+     * instead of silently using the host stub (resolver skew).  Literal-IP
+     * hosts need no DNS, so they are allowed with no resolvers. */
+    int needs_dns = 0;
+    for (int h = 0; h < g_nets[slot].n_hosts; h++) {
+        struct in_addr lit;
+        if (inet_pton(AF_INET, g_nets[slot].hosts[h].host, &lit) != 1) {
+            needs_dns = 1;
+            break;
+        }
+    }
+    if (egress_no_resolv(needs_dns, g_nets[slot].n_ns)) {
         snprintf(rep, repn, "ERR egress_no_resolv\n");
         goto fail;
     }
@@ -677,7 +692,11 @@ static int net_up(pid_t pid, char *rep, size_t repn,
             snprintf(rep, repn, "ERR egress_unresolved %s\n", bad);
             goto fail;
         }
-        egress_apply(slot, want, n);
+        if (egress_apply(slot, want, n) > 0) {
+            /* a partial allowlist would silently under-block; refuse it */
+            snprintf(rep, repn, "ERR egress_install_failed\n");
+            goto fail;
+        }
         g_nets[slot].next_refresh =
             time(NULL) + (ttl > 0 && ttl < EG_TTL_CAP ? ttl : EG_TTL_CAP);
     } else {
@@ -698,6 +717,8 @@ static int net_up(pid_t pid, char *rep, size_t repn,
              g_nets[slot].n_hosts, g_nets[slot].n_eg);
     return 0;
 fail:
+    for (int j = 0; j < g_nets[slot].n_eg; j++)
+        egress_accept(idx, g_nets[slot].eg[j].ip, g_nets[slot].eg[j].port, 0);
     egress_base(idx, 0);
     sh("ip link del vethh%d 2>/dev/null", idx);
     g_netmap[idx >> 6] &= ~(1ULL << (idx & 63));

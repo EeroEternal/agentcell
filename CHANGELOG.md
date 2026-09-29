@@ -22,6 +22,18 @@ binaries. This project adheres to [Semantic Versioning](https://semver.org/).
   numeric name — answers with a 198.18.0.0/15 address, so the allowlist was
   built for an address the cell never dials; literals are now used as-is
   and never age into the refresh loop.
+- A literal-IP-only allowlist no longer needs the cell to send `RESOLV`:
+  `egress_no_resolv` now only fires when a *hostname* would have to be
+  resolved, so `--egress 1.1.1.1:443` from a cell with no nameservers is
+  accepted instead of refused.
+- A NETUP whose `iptables -I` fails for any requested address now replies
+  `ERR egress_install_failed` and rolls back (base rules and any installed
+  ACCEPTs), instead of `OK` with a partially-installed, silently
+  under-blocking allowlist.
+- `tests/run.sh` (privileged tier) asserts the per-cell `DROP` and the
+  allowlist `ACCEPT` are actually present in `iptables -S FORWARD` while an
+  allowlisted cell is alive, and removed on teardown — the reachability
+  assertions alone passed while no rule was installed (the historical bug).
 
 ## 0.2.3 — 2026-09-29
 
