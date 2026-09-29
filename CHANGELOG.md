@@ -3,6 +3,26 @@
 All notable changes to the `agentcell` crate and the `sand` / `agentlsm`
 binaries. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- Every iptables rule that mentions a veth interface failed to install:
+  `egress_base` and `egress_accept` interpolated their op string
+  ("-I FORWARD 1" / "-D FORWARD") into a format that already contained the
+  chain name, producing `iptables -I FORWARD 1 FORWARD ...` — shell error,
+  swallowed by `2>/dev/null`. Egress allowlists were therefore always empty
+  (and teardown never removed anything). Found by the v0.2.3 certification
+  run on a real node (#7); only the contract-stub tests ran before.
+- `net_recover_startup`'s stale-link scrub was a shell syntax error (missing
+  `;` before `done`), so leftover `vethh*` links from a crashed daemon were
+  never removed and the "removed stale" journal line never appeared.
+- Literal-IP egress hosts (`--egress 1.1.1.1:443`) are no longer sent to
+  DNS. On nodes behind a fake-ip TUN proxy every A query — including for a
+  numeric name — answers with a 198.18.0.0/15 address, so the allowlist was
+  built for an address the cell never dials; literals are now used as-is
+  and never age into the refresh loop.
+
 ## 0.2.3 — 2026-09-29
 
 ### Fixed
