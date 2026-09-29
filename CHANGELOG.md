@@ -27,6 +27,21 @@ binaries. This project adheres to [Semantic Versioning](https://semver.org/).
 - An over-long control line no longer desynchronizes the protocol: after
   `ERR line_too_long`, the daemon drains the rest of the offending line
   instead of parsing its tail as new commands.
+- `agentlsm serve` takes an exclusive lock (`/run/agentcell/agentlsm.lock`)
+  and refuses to start a second instance. Startup recovery deletes every
+  `vethh*` rule it finds, which would otherwise destroy a live daemon's
+  cells; the lock is released on process death, so a crash does not lock
+  out the next start.
+- `net.ipv4.ip_forward` is restored even after a crash: the pre-daemon
+  value is persisted to `/run/agentcell/ip_forward.saved` when NAT is
+  enabled and consumed by startup recovery when a previous run died before
+  `nat_teardown()`.
+- Egress no longer falls back to `getaddrinfo()` on the host stub.  A
+  NETUP that asks for egress but carries no `RESOLV` is refused with
+  `ERR egress_no_resolv`, and a nameserver that answers nothing yields
+  `egress_unresolved` — so an old `sand` (or a cell with no resolvers)
+  fails loudly instead of silently resolving with the host's view.
+- `egress_no_resolv` is covered by `tests/contract_test`.
 
 ## 0.2.2 — 2026-09-28
 

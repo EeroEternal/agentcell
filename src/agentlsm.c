@@ -69,6 +69,7 @@ static const struct ac_sys ac_syscalls[] = { AC_SYSCALL_TAB };
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -365,32 +366,10 @@ static int resolve_egress(const char *host, const char *port,
             res_nclose(&st);
         }
     }
-    if (!got_any) {
-        struct addrinfo hints = { .ai_family = AF_INET,
-                                  .ai_socktype = SOCK_STREAM }, *ai = NULL;
-        if (!getaddrinfo(host, NULL, &hints, &ai) && ai) {
-            for (struct addrinfo *p = ai; p; p = p->ai_next) {
-                char ip[64];
-                struct sockaddr_in *sin = (void *)p->ai_addr;
-                if (!inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof ip))
-                    continue;
-                got_any = 1;
-                int dup = 0;
-                for (int j = 0; j < *n_want; j++)
-                    if (!strcmp(want[j].ip, ip) && !strcmp(want[j].port, port))
-                        { dup = 1; break; }
-                if (dup) continue;
-                if (*n_want >= max) { freeaddrinfo(ai); return -2; }
-                snprintf(want[*n_want].ip, 64, "%s", ip);
-                snprintf(want[*n_want].port, 8, "%s", port);
-                (*n_want)++;
-            }
-            freeaddrinfo(ai);
-        }
-        if (!got_any) return -1;
-        return 0;
-    }
-    return 0;
+    /* The daemon must resolve exactly as the cell does: never fall back to
+     * getaddrinfo() on the host stub, which is the resolver skew this whole
+     * path exists to avoid.  Callers turn "no answer" into a loud failure. */
+    return got_any ? 0 : -1;
 }
 
 /* Build the desired (ip,port) set for a cell. */
@@ -474,6 +453,8 @@ static void egress_refresh(void)
 }
 static int   g_nat_on;
 static int   g_fwd_save = -1;
+#define IPFWD_SAVE "/run/agentcell/ip_forward.saved"
+static void  ipfwd_persist(int v);
 
 static int sh(const char *fmt, ...)
 {
@@ -490,6 +471,8 @@ static void nat_ensure(void)
     if (g_nat_on) return;
     FILE *f = fopen("/proc/sys/net/ipv4/ip_forward", "r");
     if (f) { if (fscanf(f, "%d", &g_fwd_save) != 1) g_fwd_save = -1; fclose(f); }
+    /* persist the pre-daemon value so a crash is recoverable on restart */
+    if (g_fwd_save >= 0) ipfwd_persist(g_fwd_save);
     f = fopen("/proc/sys/net/ipv4/ip_forward", "w");
     if (f) { fputs("1\n", f); fclose(f); }
     sh("iptables -t nat -C POSTROUTING -s 10.200.0.0/16 -j MASQUERADE 2>/dev/null"
@@ -515,6 +498,32 @@ static void nat_teardown(void)
         FILE *f = fopen("/proc/sys/net/ipv4/ip_forward", "w");
         if (f) { fprintf(f, "%d\n", g_fwd_save); fclose(f); }
     }
+    unlink(IPFWD_SAVE);
+}
+
+/* ip_forward must return to its pre-daemon value even if the previous run
+ * crashed before nat_teardown(): the saved value is on disk precisely so a
+ * fresh daemon (holding the exclusive lock, so no live peer) can restore it
+ * while scrubbing the orphaned NAT rules. */
+static void ipfwd_persist(int v)
+{
+    FILE *f = fopen(IPFWD_SAVE, "w");
+    if (f) { fprintf(f, "%d\n", v); fclose(f); }
+}
+
+static void ipfwd_recover(void)
+{
+    FILE *f = fopen(IPFWD_SAVE, "r");
+    if (!f) return;
+    int v = -1;
+    if (fscanf(f, "%d", &v) == 1 && v >= 0) {
+        FILE *w = fopen("/proc/sys/net/ipv4/ip_forward", "w");
+        if (w) { fprintf(w, "%d\n", v); fclose(w); }
+        fprintf(stderr, "agentlsm: restored ip_forward=%d after a previous "
+                        "run crashed\n", v);
+    }
+    fclose(f);
+    unlink(IPFWD_SAVE);
 }
 
 /* --egress allowlist on the FORWARD chain: DNS + the whitelisted
@@ -562,6 +571,7 @@ static void net_recover_startup(void)
     sh("iptables -D FORWARD -s 10.200.0.0/16 -j ACCEPT 2>/dev/null");
     sh("iptables -D FORWARD -d 10.200.0.0/16 -j ACCEPT 2>/dev/null");
     sh("iptables -D FORWARD -s 10.200.0.0/16 -d 169.254.0.0/16 -j DROP 2>/dev/null");
+    ipfwd_recover();
 }
 
 static int net_up(pid_t pid, char *rep, size_t repn,
@@ -621,6 +631,14 @@ static int net_up(pid_t pid, char *rep, size_t repn,
     for (int k = 0; k < n_ns && k < MAX_NS; k++)
         snprintf(g_nets[slot].ns[k], sizeof g_nets[slot].ns[k], "%s", nss[k]);
     g_nets[slot].n_ns = n_ns > MAX_NS ? MAX_NS : n_ns;
+
+    /* An old `sand` (or one that found no nameserver) sends no RESOLV; the
+     * daemon can no longer resolve the way the cell does, so refuse loudly
+     * instead of silently using the host stub (resolver skew). */
+    if (egress_no_resolv(n_eg, g_nets[slot].n_ns)) {
+        snprintf(rep, repn, "ERR egress_no_resolv\n");
+        goto fail;
+    }
 
     if (n_eg > 0) {
         egress_base(idx, 1);
@@ -857,17 +875,40 @@ static void serve_line(int ci, char *line)
         conn_drop(ci);
 }
 
+/* One serve per host.  net_recover_startup() removes every vethh* rule it
+ * finds, which would destroy a live daemon's cells, so hold an exclusive
+ * lock and refuse to start a second one instead.  The lock is released when
+ * the process dies, so a crash does not lock out the next start. */
+static int daemon_lock(void)
+{
+    mkdir("/run/agentcell", 0755);
+    int fd = open("/run/agentcell/agentlsm.lock",
+                  O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) { perror("agentlsm: lock"); return -1; }
+    if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+        fprintf(stderr, "agentlsm: another agentlsm serve is already running "
+                        "(/run/agentcell/agentlsm.lock); refusing to start\n");
+        close(fd);
+        return -1;
+    }
+    return fd;   /* hold for the daemon's lifetime */
+}
+
 static int serve_mode(void)
 {
     if (geteuid() != 0) {
         fprintf(stderr, "agentlsm: serve must run as root\n");
         return 1;
     }
+
+    int lockfd = daemon_lock();
+    if (lockfd < 0) return 1;
+    (void)lockfd;
+
     if (bpf_load_attach(0, 1, 0, 0, 0 /* MODE_SERVE */)) return 1;
 
     net_recover_startup();
 
-    mkdir("/run/agentcell", 0755);
     unlink(LSM_SOCK);
 
     int lfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);

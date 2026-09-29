@@ -53,6 +53,20 @@ int main(void)
     /* net_up failed without naming a reason -> generic */
     expect_reply(1, 0, -1, "", "ERR netup\n", "unnamed failure");
 
+    /* a cell that wants egress but sent no resolvers is refused loudly */
+    if (!egress_no_resolv(1, 0)) {
+        fprintf(stderr, "FAIL no-resolv: egress without resolvers should be rejected\n");
+        failures++;
+    }
+    if (egress_no_resolv(0, 0)) {
+        fprintf(stderr, "FAIL no-resolv: no egress needs no resolvers\n");
+        failures++;
+    }
+    if (egress_no_resolv(1, 2)) {
+        fprintf(stderr, "FAIL no-resolv: resolvers present must pass\n");
+        failures++;
+    }
+
     /* drain math: bytes to keep after the first newline */
     expect_drain("partial", -1, "drain: no newline");
     expect_drain("garbage\n", 0, "drain: newline at end");

@@ -41,6 +41,17 @@ static inline void netup_reply(int parsed, int too_many, int rc,
 }
 
 /*
+ * A cell that asked for egress but sent no nameservers cannot be resolved
+ * the way the cell resolves.  Falling back to getaddrinfo() on the host
+ * stub re-creates the resolver skew this path exists to avoid, so net_up()
+ * refuses such a request with "ERR egress_no_resolv".
+ */
+static inline int egress_no_resolv(int n_eg, int n_ns)
+{
+    return n_eg > 0 && n_ns == 0;
+}
+
+/*
  * After an over-long line was rejected, how many bytes after its first
  * newline must be kept (parsing resumes there)?  Returns -1 while no
  * newline has arrived yet.  `data` is the freshly read chunk.
