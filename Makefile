@@ -31,7 +31,8 @@ agentmon: src/agentmon.c $(BPFHDR)
 	$(CC) $(CFLAGS) -include $(BPFHDR) -o $@ src/agentmon.c -lbpf -lelf -lz
 
 clean:
-	rm -f sand agentmon agentlsm tests/stub-agentlsm $(BPFOBJ) $(BPFHDR)
+	rm -f sand agentmon agentlsm tests/stub-agentlsm tests/contract_test \
+	      $(BPFOBJ) $(BPFHDR)
 
 .PHONY: all clean
 
@@ -67,12 +68,17 @@ install-apparmor:
 	  apparmor_parser -r /etc/apparmor.d/usr.bin.sand; \
 	fi
 
-check: all tests/stub-agentlsm
+check: all tests/stub-agentlsm tests/contract_test
+	tests/contract_test
 	tests/run.sh
 
 # Fake agentlsm control socket: drives the NETUP reply branches from tests/run.sh
 # without root and without a live daemon.
 tests/stub-agentlsm: tests/stub-agentlsm.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+# Unit test for the NETUP reply policy + over-long-line drain math; no BPF/root.
+tests/contract_test: tests/contract_test.c src/netup_reply.h
 	$(CC) $(CFLAGS) -o $@ $<
 
 # C ABI library (RFC 0001, Gap 5) — same isolation code as the CLI

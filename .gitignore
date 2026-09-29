@@ -7,6 +7,7 @@ src/agentlsm.bpf.o
 src/agentlsm.bpf.h
 src/vmlinux.h
 tests/stub-agentlsm
+tests/contract_test
 os/out/
 ffi-demo
 libagentcell.a
