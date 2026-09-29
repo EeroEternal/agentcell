@@ -66,10 +66,11 @@ sudook(){
 lsmok(){ sudook && $SUDO cat /sys/kernel/security/lsm 2>/dev/null \
                   | tr ',' '\n' | grep -qx bpf; }
 
-DAEMON_PID=""; CELL_PID=""; STUB_PID=""
+DAEMON_PID=""; CELL_PID=""; STUB_PID=""; EG_PID=""
 cleanup(){
     trap - EXIT
     [ -n "$CELL_PID" ] && kill "$CELL_PID" 2>/dev/null
+    [ -n "$EG_PID" ] && { kill "$EG_PID" 2>/dev/null; wait "$EG_PID" 2>/dev/null; }
     [ -n "$STUB_PID" ] && { kill -9 "$STUB_PID" 2>/dev/null; wait "$STUB_PID" 2>/dev/null; }
     if [ -n "$DAEMON_PID" ]; then
         $SUDO pkill -TERM -x agentlsm 2>/dev/null
@@ -512,6 +513,38 @@ if lsmok; then
     fi
     t_out "egress: DNS still allowed" "example" \
           ./sand --net veth --egress 1.1.1.1:443 -- getent hosts example.com
+
+    # The historical failure mode was every "reachable" assertion passing
+    # while NO iptables rule was installed: the cell then fell through to the
+    # unrestricted global `FORWARD -s 10.200/16 -j ACCEPT`.  Assert the rules
+    # are really in the kernel while an allowlisted cell is alive, and gone
+    # once it exits.
+    ./sand --net veth --egress 1.1.1.1:443 -- sleep 6 >>"$LOG" 2>&1 &
+    EG_PID=$!
+    for _ in $(seq 40); do
+        $SUDO iptables -S FORWARD 2>/dev/null | grep -q -- '-i vethh' && break
+        sleep 0.1
+    done
+    if $SUDO iptables -S FORWARD 2>/dev/null \
+         | grep -q -- '-i vethh[0-9]* -j DROP'; then
+        pass "egress: base DROP installed"
+    else
+        fail "egress: base DROP installed"
+    fi
+    if $SUDO iptables -S FORWARD 2>/dev/null \
+         | grep -q -- '-d 1.1.1.1/32 .*--dport 443 -j ACCEPT'; then
+        pass "egress: allowlist ACCEPT installed"
+    else
+        fail "egress: allowlist ACCEPT installed"
+    fi
+    wait "$EG_PID" 2>/dev/null
+    EG_PID=""
+    sleep 0.5
+    if $SUDO iptables -S FORWARD 2>/dev/null | grep -q -- '-i vethh'; then
+        fail "egress: rules removed on teardown"
+    else
+        pass "egress: rules removed on teardown"
+    fi
 
     # block-all, scoped to a throwaway cell: kernel-side time-bounded
     # deny-everything window.  The SYSTEM-WIDE variant is intentionally

@@ -41,14 +41,15 @@ static inline void netup_reply(int parsed, int too_many, int rc,
 }
 
 /*
- * A cell that asked for egress but sent no nameservers cannot be resolved
- * the way the cell resolves.  Falling back to getaddrinfo() on the host
- * stub re-creates the resolver skew this path exists to avoid, so net_up()
- * refuses such a request with "ERR egress_no_resolv".
+ * A cell whose allowlist includes a hostname cannot be resolved the way the
+ * cell resolves when it sent no nameservers.  Falling back to getaddrinfo()
+ * on the host stub re-creates the resolver skew this path exists to avoid, so
+ * net_up() refuses such a request with "ERR egress_no_resolv".  A
+ * literal-IP-only allowlist needs no DNS and is allowed.
  */
-static inline int egress_no_resolv(int n_eg, int n_ns)
+static inline int egress_no_resolv(int needs_dns, int n_ns)
 {
-    return n_eg > 0 && n_ns == 0;
+    return needs_dns && n_ns == 0;
 }
 
 /*
