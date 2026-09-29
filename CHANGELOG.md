@@ -3,7 +3,7 @@
 All notable changes to the `agentcell` crate and the `sand` / `agentlsm`
 binaries. This project adheres to [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 0.2.3 — 2026-09-29
 
 ### Fixed
 
