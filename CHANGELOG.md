@@ -3,6 +3,20 @@
 All notable changes to the `agentcell` crate and the `sand` / `agentlsm`
 binaries. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- `sand` no longer points proxy-aware clients at the egress host: with a
+  single `--egress` entry it used to set `http_proxy`/`https_proxy`/`all_proxy`
+  to `http://<egress-host>:<port>`, so `curl`, `cargo` and `git` over HTTP(S)
+  tried to CONNECT-tunnel through the allowlisted business host and failed
+  instantly (`exit 000`). The veth+iptables path needs no proxy; a future
+  CONNECT proxy will get an explicit opt-in flag instead.
+- Build fix for gcc 11 / glibc 2.35: `src/sand.c` now includes `<stddef.h>`
+  for `offsetof` instead of relying on a transitive include. On Ubuntu 22.04
+  the build failed with `expected expression before 'struct'`.
+
 ## 0.2.4 — 2026-09-29
 
 ### Fixed

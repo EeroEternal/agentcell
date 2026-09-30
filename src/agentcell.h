@@ -34,8 +34,7 @@ struct agentcell_config {
     uint32_t    pids;           /* 0 = 256 */
     int         net;            /* AGENTCELL_NET_* */
     const char *egress;         /* "host[:port]" — NET_VETH only: DNS +
-                                 * this dst pass, all else DROPped; also
-                                 * sets http_proxy inside the jail.
+                                 * this dst pass, all else DROPped.
                                  * port defaults to 443 */
     int         secure;         /* agentlsm enforcement (deny /etc/shadow) */
     int         no_landlock;    /* debug */
