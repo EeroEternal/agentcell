@@ -2152,7 +2152,6 @@ static void usage(FILE *out)
 "  --egress H[:P] outbound allowlist via --net veth (repeatable): DNS\n"
 "                plus every H (all A records) and port P (default 443)\n"
 "                passes; everything else DROPped at the host firewall.\n"
-"                One entry also sets http_proxy/https_proxy inside the cell\n"
 "  --env K=V     set an env var in the cell (repeatable).  NOT for\n"
 "                secrets: argv is visible to other host users\n"
 "  --env-file F  load K=V lines from F (use a 0600 file) into the cell env\n"
