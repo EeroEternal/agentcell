@@ -138,10 +138,20 @@ fi
 section "--rootfs"
 RF="$RT/cell-root"
 if os/cell-root/build.sh --minimal "$RF" >>"$LOG" 2>&1; then
+    [ "$(stat -c %a "$RF")" = 755 ] \
+        && pass "rootfs is accessible to a different unprivileged user" \
+        || fail "rootfs is accessible to a different unprivileged user"
+    [ -d "$RF/opt" ] \
+        && pass "rootfs provides the optional OS mountpoint" \
+        || fail "rootfs provides the optional OS mountpoint"
     t_out "rootfs echo" "hi" ./sand --rootfs "$RF" -- echo hi
+    t_out "rootfs python" "python-ok" ./sand --rootfs "$RF" -- python3 -c 'print("python-ok")'
     t_no  "rootfs still seccomp" ./sand --rootfs "$RF" -- unshare -p true
 else
+    skip "rootfs is accessible to a different unprivileged user" "cell-root build failed"
+    skip "rootfs provides the optional OS mountpoint" "cell-root build failed"
     skip "rootfs echo" "cell-root build failed"
+    skip "rootfs python" "cell-root build failed"
     skip "rootfs still seccomp" "cell-root build failed"
 fi
 

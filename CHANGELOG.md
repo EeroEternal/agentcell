@@ -3,6 +3,22 @@
 All notable changes to the `agentcell` crate and the `sand` / `agentlsm`
 binaries. This project adheres to [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- Minimal rootfs now includes Python 3, its standard library, and common
+  text/file utilities so cells can run ordinary agent scripts without binding
+  the live host `/usr` tree.
+
+### Fixed
+
+- Minimal rootfs directories are now mode `0755` instead of inheriting
+  `mktemp`'s `0700`, so a cell launched by a different unprivileged user can
+  traverse and mount the OS view.
+- Minimal rootfs includes `/opt`, avoiding a non-fatal missing-mountpoint
+  warning during sandbox setup.
+
 ## 0.2.5 — 2026-09-30
 
 ### Fixed

@@ -17,6 +17,7 @@ done
 [ -n "$OUT" ] || { echo "usage: $0 [--minimal|--from-host] OUTDIR|OUT.img" >&2; exit 2; }
 
 ST=$(mktemp -d /tmp/cell-root.XXXXXX)
+chmod 0755 "$ST"
 trap 'rm -rf "$ST"' EXIT
 
 copy_bin() {
@@ -25,7 +26,7 @@ copy_bin() {
     local p
     p=$(type -P "$b" 2>/dev/null) || p="/usr/bin/$b"
     [ -f "$p" ] || return 0
-    cp -a "$p" "$dest/"
+    cp -aL "$p" "$dest/"
     # copy .so deps (best-effort).  ldd prints the ELF interpreter as
     # "  /lib64/ld-linux... (0x...)" on Ubuntu (leading blanks, no "=>")
     # but as "/lib64/... => /lib64/..." on Arch — match both shapes
@@ -50,12 +51,19 @@ if [ "$MODE" = host ]; then
     [ -L /lib ] && cp -P /lib "$ST/lib" || true
     [ -L /lib64 ] && cp -P /lib64 "$ST/lib64" || true
 else
-    mkdir -p "$ST/usr/bin" "$ST/etc" "$ST/tmp" "$ST/proc" "$ST/dev" "$ST/home/agent"
+    mkdir -p "$ST/usr/bin" "$ST/etc" "$ST/tmp" "$ST/proc" "$ST/dev" "$ST/opt" "$ST/home/agent"
     echo "cell-root" > "$ST/etc/hostname"
     printf 'root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/:/bin/false\n' > "$ST/etc/passwd"
-    for b in bash sh cat echo ls true false pwd uname; do
+    for b in bash sh cat echo ls true false pwd uname python3 \
+             grep sed awk find xargs head tail wc sort uniq id env sleep \
+             touch mkdir rm cp mv; do
         copy_bin "$b"
     done
+    if command -v python3 >/dev/null 2>&1; then
+        stdlib=$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])')
+        mkdir -p "$ST$(dirname "$stdlib")"
+        cp -a "$stdlib" "$ST$(dirname "$stdlib")/"
+    fi
     ln -sfn usr/bin "$ST/bin"
     mkdir -p "$ST/usr/lib"
     # Ubuntu ldd copies land in real lib/ and lib64/ dirs — keep those
