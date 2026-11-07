@@ -48,8 +48,8 @@
  *     their -EPERM return is visible on the exit path.  One watcher
  *     stream for everything.
  *
- * Socket: /run/agentcell/lsm.sock (0666 — single-user trust model for
- * now: anyone local may register policy; document before sharing).
+ * Socket: /run/agentcell/lsm.sock (0660, root and the trusted group that
+ * launched the daemon, or the agentcell group for service launches).
  */
 #define _GNU_SOURCE
 #include <bpf/bpf.h>
@@ -58,6 +58,8 @@
 #include <arpa/nameser.h>
 #include <errno.h>
 #include <netdb.h>
+#include <grp.h>
+#include <pwd.h>
 #include <resolv.h>
 #include <stdarg.h>
 #include "arch/syscalls.h"   /* AC_* syscall table */
@@ -938,6 +940,19 @@ static int daemon_lock(void)
     return fd;   /* hold for the daemon's lifetime */
 }
 
+static gid_t control_group(void)
+{
+    const char *sudo_uid = getenv("SUDO_UID");
+    if (sudo_uid) {
+        struct passwd *pw = getpwuid((uid_t)strtol(sudo_uid, NULL, 10));
+        if (pw) return pw->pw_gid;
+    }
+    struct group *trusted = getgrnam("agentcell");
+    if (trusted) return trusted->gr_gid;
+    fprintf(stderr, "agentlsm: agentcell group is required for socket access\n");
+    return (gid_t)-1;
+}
+
 static int serve_mode(void)
 {
     if (geteuid() != 0) {
@@ -963,7 +978,12 @@ static int serve_mode(void)
     if (bind(lfd, (struct sockaddr *)&a, alen) < 0 || listen(lfd, 16) < 0) {
         perror("agentlsm: bind " LSM_SOCK); return 1;
     }
-    chmod(LSM_SOCK, 0666);
+    gid_t control_gid = control_group();
+    if (control_gid == (gid_t)-1 ||
+        chown(LSM_SOCK, 0, control_gid) < 0 || chmod(LSM_SOCK, 0660) < 0) {
+        perror("agentlsm: restrict " LSM_SOCK);
+        return 1;
+    }
 
     struct ring_buffer *rb =
         ring_buffer__new(g_fd_events, on_evt, NULL, NULL);

@@ -312,9 +312,9 @@ sudo ./agentlsm serve
 ./sand lsm reset agentcell-16514                # drop all its rules
 ```
 
-Cells register on start and unregister on exit; if the daemon is down,
-`sand` prints a warning and runs without the LSM layer (fail-open for
-availability — mount RO + Landlock still apply).
+Cells register on start and unregister on exit. If the daemon is down or no
+cgroup is available, `--secure` fails closed instead of starting a cell without
+its requested LSM enforcement.
 
 One-shot debug modes (verified end-to-end):
 
@@ -333,9 +333,9 @@ sudo ./agentlsm --block-all 1 --cgroup /sys/fs/cgroup/.../agentcell-<PID>
 of schedule — the mechanism used to prove the attach path works when
 filtered policies mysteriously "didn't" (they did; the test was wrong).
 
-Trust model: the control socket is 0666 — any local user can register
-policy for any cgroup id. Fine on a single-user workstation; needs peer
-credentials + an allowlist before multi-user use.
+Trust model: the control socket is 0660, owned by root and the trusted group
+of the user who launched the daemon (the `agentcell` group for service
+launches). Only root and members of that group can register or change policy.
 
 ## C API (`libagentcell`, for hosts like Keel)
 

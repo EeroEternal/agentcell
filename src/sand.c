@@ -230,7 +230,7 @@ static long  g_execs;
 static __u64 g_lsm_cgid;              /* cell id at the agentlsm daemon    */
 static int   g_lsm_on;
 
-static void lsm_register(void);       /* defined with the exec client code */
+static int  lsm_register(void);       /* defined with the exec client code */
 static void lsm_unregister(void);
 static int  net_veth_register(pid_t child);
 static void net_veth_unregister(pid_t child);
@@ -1529,10 +1529,10 @@ static int lsm_cmd(const char *cmd, char *rep, size_t repn)
 }
 
 /* arm this cell's policy at the daemon; called after cgroup park */
-static void lsm_register(void)
+static int lsm_register(void)
 {
     struct stat st;
-    if (stat(g_cgpath, &st) < 0) return;
+    if (stat(g_cgpath, &st) < 0) return -1;
     g_lsm_cgid = (__u64)st.st_ino;
 
     /* defaults keep secrets of the host out of agent reach; note the
@@ -1544,8 +1544,8 @@ static void lsm_register(void)
     int s = lsm_connect();
     if (s < 0) {
         fprintf(stderr, "sand: --secure: agentlsm daemon not running "
-                        "(sudo agentlsm serve) — LSM enforcement OFF\n");
-        return;
+                        "(sudo agentlsm serve); failing closed\n");
+        return -1;
     }
 
     int ok = 0;
@@ -1555,8 +1555,11 @@ static void lsm_register(void)
         snprintf(cmd, sizeof cmd, "ADD %llu %s",
                  (unsigned long long)g_lsm_cgid, pfx);
         if (write_full(s, cmd, strlen(cmd)) || write_full(s, "\n", 1) ||
-            read(s, rep, sizeof rep - 1) <= 0 || strncmp(rep, "OK", 2))
-            { close(s); fprintf(stderr, "sand: agentlsm ADD failed\n"); return; }
+            read(s, rep, sizeof rep - 1) <= 0 || strncmp(rep, "OK", 2)) {
+            close(s);
+            fprintf(stderr, "sand: agentlsm ADD failed; failing closed\n");
+            return -1;
+        }
         ok++;
     }
     close(s);
@@ -1564,6 +1567,7 @@ static void lsm_register(void)
     fprintf(stderr, "sand: LSM armed: %d deny prefix%s via agentlsm "
                     "(cgid %llu)\n", ok, ok == 1 ? "" : "es",
                     (unsigned long long)g_lsm_cgid);
+    return 0;
 }
 
 static void lsm_unregister(void)
@@ -2439,8 +2443,16 @@ int main(int argc, char **argv)
         fprintf(stderr, "sand: pid %d  cgroup %s\n", pid, g_cgpath);
     }
 
-    if (C.secure && g_have_cg)
-        lsm_register();
+    if (C.secure) {
+        if (!g_have_cg)
+            fprintf(stderr, "sand: --secure requires a cgroup; failing closed\n");
+        if (!g_have_cg || lsm_register() < 0) {
+            kill(pid, SIGKILL);
+            waitpid(pid, NULL, 0);
+            if (g_have_cg) rmdir(g_cgpath);
+            _exit(127);
+        }
+    }
 
     /* --net veth: the daemon moves one end of a fresh pair into the
      * child's netns (created by clone, child still waits on the pipe);

@@ -11,6 +11,12 @@ binaries. This project adheres to [Semantic Versioning](https://semver.org/).
   text/file utilities so cells can run ordinary agent scripts without binding
   the live host `/usr` tree.
 
+### Security
+
+- `--secure` now fails closed when its cgroup or LSM daemon is unavailable.
+- The LSM control socket is `0660` and restricted to root plus the trusted
+  daemon-launching group instead of world-writable `0666`.
+
 ### Fixed
 
 - Minimal rootfs directories are now mode `0755` instead of inheriting

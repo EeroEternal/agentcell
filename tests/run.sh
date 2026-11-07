@@ -385,6 +385,11 @@ CELL_PID=""
 section "sand lsm without daemon"
 if ./sand lsm >>"$LOG" 2>&1; then fail "lsm errors without daemon"
 else pass "lsm errors without daemon"; fi
+if ./sand --secure -- true >>"$LOG" 2>&1; then
+    fail "--secure fails closed without daemon"
+else
+    pass "--secure fails closed without daemon"
+fi
 
 # ---- 2. privileged: agentmon probes -------------------------------------
 if sudook; then
