@@ -40,6 +40,14 @@ copy_bin() {
     done
 }
 
+copy_so() {
+    local name=$1 p
+    p=$(ldconfig -p | awk -v name="$name" '$1 == name {path = $NF} END {print path}')
+    [ -f "$p" ] || return 0
+    mkdir -p "$ST$(dirname "$p")"
+    cp -anL "$p" "$ST$p" 2>/dev/null || true
+}
+
 if [ "$MODE" = host ]; then
     echo "copying host /usr /etc (this is large)..." >&2
     mkdir -p "$ST"
@@ -63,6 +71,7 @@ else
         stdlib=$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])')
         mkdir -p "$ST$(dirname "$stdlib")"
         cp -a "$stdlib" "$ST$(dirname "$stdlib")/"
+        copy_so libffi.so.8
     fi
     ln -sfn usr/bin "$ST/bin"
     mkdir -p "$ST/usr/lib"

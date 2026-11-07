@@ -18,6 +18,10 @@ binaries. This project adheres to [Semantic Versioning](https://semver.org/).
   traverse and mount the OS view.
 - Minimal rootfs includes `/opt`, avoiding a non-fatal missing-mountpoint
   warning during sandbox setup.
+- Python `ctypes` works in the minimal rootfs: `libffi.so.8` is included even
+  though the dynamic loader does not list it as a direct Python dependency.
+  The library lookup no longer terminates `ldconfig` with SIGPIPE under
+  `set -o pipefail`.
 
 ## 0.2.5 — 2026-09-30
 
